@@ -1,0 +1,1 @@
+# 本插件只依赖 AstrBot 自带能力（conversation_manager / register_web_api / Quart），无额外依赖

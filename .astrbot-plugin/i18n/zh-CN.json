@@ -1,0 +1,10 @@
+{
+  "metadata": {
+    "display_name": "对话管理"
+  },
+  "views": {
+    "dashboard": {
+      "title": "对话管理"
+    }
+  }
+}

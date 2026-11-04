@@ -1,0 +1,29 @@
+{
+  "snapshot_keep": {
+    "description": "每对话快照保留份数（超出滚动淘汰）",
+    "type": "int",
+    "default": 20,
+    "hint": "每次保存/导入/压缩前都会自动快照，可在面板里一键回滚"
+  },
+  "poll_interval": {
+    "description": "面板自动刷新间隔（秒，0=关闭）",
+    "type": "int",
+    "default": 5
+  },
+  "token_threshold": {
+    "description": "上下文压力估算阈值（est token，达到后面板提示可能触发自动压缩）",
+    "type": "int",
+    "default": 12800,
+    "hint": "与你 AstrBot 生成设置里的上下文上限保持一致即可；仅作面板提示，不影响 bot 行为"
+  },
+  "compress_keep_ratio": {
+    "description": "手动压缩默认保留最近对话比例（0~0.3）",
+    "type": "float",
+    "default": 0.15
+  },
+  "compress_instruction": {
+    "description": "压缩摘要指令（留空使用内置默认；分块与合并阶段都会使用）",
+    "type": "text",
+    "default": ""
+  }
+}
