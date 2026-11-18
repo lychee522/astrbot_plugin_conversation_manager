@@ -144,7 +144,7 @@ def validate_history(history: Any) -> tuple[bool, str]:
     PLUGIN_NAME,
     "lychee522",
     "对话可视化管理：浏览/编辑/删除/插入消息、自动快照撤销、JSONL 导入导出、手动分块压缩摘要",
-    "1.0.0",
+    "1.0.1",
 )
 class ConversationManagerPlugin(Star):
     def __init__(self, context: Context, config=None) -> None:

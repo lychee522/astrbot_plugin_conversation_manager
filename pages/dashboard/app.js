@@ -254,7 +254,7 @@
     else { g.textContent = `上下文 ~${est} / ${th} tok`; }
   }
 
-  // 系统提醒仅在消息头显示时间，气泡内不再渲染；think 思考过程不展示
+  // 系统提醒仅在消息头显示时间，气泡内不再渲染；think 思考过程以折叠条展示
   function stripReminder(t) {
     return String(t == null ? "" : t).replace(/<system_reminder>[\s\S]*?<\/system_reminder>/g, "");
   }
@@ -268,21 +268,26 @@
       return s ? renderText(s) : "<em class='muted small'>(空消息)</em>";
     }
     if (Array.isArray(c)) {
-      let html = "";
-      let hasVisible = false;
+      let thinkHtml = "";
+      let bodyHtml = "";
+      let hasBody = false;
       for (const p of c) {
         if (!p || typeof p !== "object") continue;
-        if (p.type === "text") {
+        if (p.type === "think") {
+          const th = String(p.think || "").trim();
+          if (th) {
+            thinkHtml += `<details class="think"><summary>💭 思考过程（${th.length} 字）</summary><div class="think-body">${esc(th)}</div></details>`;
+          }
+        } else if (p.type === "text") {
           const s = stripReminder(p.text).trim();
-          if (s) { html += (hasVisible ? "\n" : "") + renderText(s); hasVisible = true; }
-        } else if (p.type === "think") {
-          // 思考过程按需求不展示
+          if (s) { bodyHtml += (hasBody ? "\n" : "") + renderText(s); hasBody = true; }
         } else if (p.type) {
-          html += `<span class="part-img">[${esc(p.type)} · 只读]</span>`;
-          hasVisible = true;
+          bodyHtml += (hasBody ? "\n" : "") + `<span class="part-img">[${esc(p.type)} · 只读]</span>`;
+          hasBody = true;
         }
       }
-      return html || "<em class='muted small'>(空消息)</em>";
+      const total = thinkHtml + bodyHtml;
+      return total || "<em class='muted small'>(空消息)</em>";
     }
     return `<em class='muted small'>(未知内容类型)</em>`;
   }
@@ -308,6 +313,9 @@
     }
     const inner = start > 0 ? `<div class="timeline-inner">${html}</div>` : `<div class="timeline-inner">${html}</div>`;
     tl.innerHTML = inner;
+    tl.querySelectorAll("details.think").forEach((d) => {
+      d.addEventListener("click", (ev) => ev.stopPropagation());
+    });
     tl.querySelectorAll("[data-act]").forEach((b) => {
       const act = b.dataset.act;
       if (act === "more") {
@@ -339,8 +347,23 @@
   }
 
   // ---------- local edit ops ----------
+  function calcEstTokens(hist) {
+    let chars = 0;
+    for (const m of hist) {
+      const c = m && m.content;
+      if (typeof c === "string") chars += c.length;
+      else if (Array.isArray(c)) {
+        for (const p of c) {
+          if (p && typeof p === "object") chars += String(p.text || p.think || "").length;
+        }
+      }
+      chars += 8;
+    }
+    return Math.floor(chars / 4.5) + 4 * hist.length;
+  }
   function markDirty() {
     state.dirty = true;
+    if (state.current) state.current.est_tokens = calcEstTokens(state.history);
     updateSaveBar();
   }
   function updateSaveBar() {
@@ -371,13 +394,18 @@
       <div class="field"><label>角色</label>
         <select id="ins-role"><option value="user">用户</option><option value="assistant">助手</option></select>
       </div>
+      <div class="field"><label>💭 思考过程（可选，留空则无思考过程）</label><textarea id="ins-think" placeholder="可选：输入模型思考过程（think）" style="min-height:80px"></textarea></div>
       <div class="field"><label>内容（文本）</label><textarea id="ins-text" placeholder="输入消息文本"></textarea></div>
     `, '<button class="btn" data-close>取消</button><button class="btn primary" id="ins-ok">插入</button>');
     m.querySelector("#ins-ok").onclick = () => {
       const role = m.querySelector("#ins-role").value;
+      const think = m.querySelector("#ins-think").value.trim();
       const text = m.querySelector("#ins-text").value;
-      if (!text.trim()) { toast("内容不能为空", true); return; }
-      state.history.splice(at, 0, { role, content: text });
+      if (!text.trim() && !think) { toast("内容与思考过程不能同时为空", true); return; }
+      const content = think
+        ? [{ type: "think", think }, { type: "text", text }]
+        : text;
+      state.history.splice(at, 0, { role, content });
       state.selectedIdx = null;
       state.windowStart = Math.min(state.windowStart, Math.max(0, state.history.length - PAGE_SIZE));
       closeModal(); markDirty(); renderTimeline(); renderGuard();
@@ -387,9 +415,17 @@
     const m = state.history[i];
     const c = m.content;
     const stringMode = typeof c === "string";
+    let existingThink = "";
+    if (Array.isArray(c)) {
+      const thinks = [];
+      for (const p of c) {
+        if (p && p.type === "think" && p.think != null) thinks.push(String(p.think));
+      }
+      existingThink = thinks.join("\n\n");
+    }
     let partsHtml = "";
     if (stringMode) {
-      partsHtml = `<div class="field"><label>内容（字符串型消息）</label>
+      partsHtml = `<div class="field"><label>回复/消息内容（文本）</label>
         <textarea class="edit-t" data-p="0">${esc(c)}</textarea></div>`;
     } else if (Array.isArray(c)) {
       let ti = 0;
@@ -400,7 +436,10 @@
           ti++;
         }
       });
-      if (!ti) partsHtml = `<div class="muted small">该消息没有可编辑的文本片段（仅含图片/媒体等只读内容）</div>`;
+      if (!ti) {
+        partsHtml = `<div class="field"><label>补充文本内容（可选）</label>
+          <textarea class="edit-t" data-p="new-text" placeholder="该消息当前无文本片段，可在此补充"></textarea></div>`;
+      }
     } else {
       partsHtml = `<div class="muted small">未知内容类型，仅可修改角色</div>`;
     }
@@ -411,24 +450,48 @@
           <option value="assistant" ${m.role === "assistant" ? "selected" : ""}>助手</option>
         </select>
       </div>
+      <div class="field"><label>💭 思考过程（think · 留空表示无/删除思考过程）</label>
+        <textarea id="ed-think" placeholder="无思考过程（可在此输入新增，或清空以删除原思考过程）" style="min-height:95px">${esc(existingThink)}</textarea>
+      </div>
       <div class="edit-area">${partsHtml}</div>
     `, '<button class="btn" data-close>取消</button><button class="btn primary" id="ed-ok">应用（本地，稍后统一保存）</button>');
     m2.querySelector("#ed-ok").onclick = () => {
       const newRole = m2.querySelector("#ed-role").value;
+      const thinkVal = m2.querySelector("#ed-think").value.trim();
       if (stringMode) {
-        state.history[i] = { role: newRole, content: m2.querySelector(".edit-t").value };
+        const textVal = m2.querySelector(".edit-t").value;
+        if (thinkVal) {
+          state.history[i] = {
+            role: newRole,
+            content: [{ type: "think", think: thinkVal }, { type: "text", text: textVal }],
+          };
+        } else {
+          state.history[i] = { role: newRole, content: textVal };
+        }
       } else if (Array.isArray(c)) {
         const nm = JSON.parse(JSON.stringify(m));
         nm.role = newRole;
         m2.querySelectorAll(".edit-t").forEach((ta) => {
-          const pi = parseInt(ta.dataset.p, 10);
-          if (nm.content[pi] && nm.content[pi].type === "text") nm.content[pi].text = ta.value;
+          if (ta.dataset.p === "new-text") {
+            if (ta.value) nm.content.push({ type: "text", text: ta.value });
+          } else {
+            const pi = parseInt(ta.dataset.p, 10);
+            if (nm.content[pi] && nm.content[pi].type === "text") nm.content[pi].text = ta.value;
+          }
         });
+        const firstThink = nm.content.find((p) => p && p.type === "think");
+        nm.content = nm.content.filter((p) => !(p && p.type === "think"));
+        if (thinkVal) {
+          const thinkPart = firstThink
+            ? Object.assign({}, firstThink, { type: "think", think: thinkVal })
+            : { type: "think", think: thinkVal };
+          nm.content.unshift(thinkPart);
+        }
         state.history[i] = nm;
       } else {
         state.history[i].role = newRole;
       }
-      closeModal(); markDirty(); renderTimeline();
+      closeModal(); markDirty(); renderTimeline(); renderGuard();
     };
   }
 

@@ -128,8 +128,9 @@ body {
 .msg-row.user .bubble .sys-rem { color: rgba(255, 255, 255, 0.75); }
 .bubble .part-img { display: inline-block; background: rgba(128, 128, 128, 0.2); border-radius: 6px; padding: 2px 8px; font-size: 12px; margin: 2px 4px 0 0; }
 .bubble.readonly { opacity: 0.75; }
-details.think { font-size: 12px; color: var(--text-dim); background: var(--bg-hover); border-radius: 8px; padding: 4px 8px; white-space: pre-wrap; }
-details.think summary { cursor: pointer; user-select: none; }
+details.think { font-size: 12px; color: var(--text-dim); background: var(--bg-hover); border: 1px dashed var(--border); border-radius: 8px; padding: 4px 8px; margin-bottom: 6px; white-space: normal; cursor: default; }
+details.think summary { cursor: pointer; user-select: none; font-weight: 500; }
+details.think .think-body { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
 .msg-ops { position: absolute; top: -12px; display: flex; flex-direction: row; gap: 4px; opacity: 0; transition: opacity 0.15s; z-index: 5; }
 .msg-row.assistant .msg-ops { left: 2px; }
 .msg-row.user .msg-ops { right: 2px; }
