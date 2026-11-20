@@ -135,6 +135,49 @@ def est_tokens(history: list[dict]) -> int:
     return calc_stats(history)["est_tokens"]
 
 
+SUMMARY_PREFIX = "Our previous history conversation summary:"
+_END_PUNCT = set("。！？….”』」）】.!?'\"~～)）]】》>：:")
+
+
+def _extract_prev_summary(rounds: list[list[dict]]) -> tuple[str, list[list[dict]]]:
+    """检查开头是否已有前一次压缩生成的长期摘要；若有则独立剥离出来用于增量合并，避免被丢弃或截断。"""
+    if not rounds:
+        return "", rounds
+    first_round = rounds[0]
+    if not first_round:
+        return "", rounds
+    first_msg = first_round[0]
+    c = first_msg.get("content")
+    text = ""
+    if isinstance(c, str):
+        text = c
+    elif isinstance(c, list):
+        text = "\n".join(str(p.get("text") or "") for p in c if isinstance(p, dict) and p.get("type") == "text")
+    text = text.strip()
+    if text.startswith(SUMMARY_PREFIX):
+        prev_body = text[len(SUMMARY_PREFIX):].strip()
+        return prev_body, rounds[1:]
+    return "", rounds
+
+
+def _check_not_truncated(resp: Any, text: str, pid: str) -> None:
+    """检查模型输出是否因 max_tokens 被中途截断，杜绝把半截腰斩的摘要写回数据库。"""
+    raw = getattr(resp, "raw_completion", None)
+    try:
+        choices = getattr(raw, "choices", None)
+        if choices and getattr(choices[0], "finish_reason", None) == "length":
+            raise RuntimeError(f"模型 {pid} 输出触发了 max_tokens 长度上限被中途截断，请在模型配置中调大 max_tokens 或更换模型")
+    except RuntimeError:
+        raise
+    except Exception:
+        pass
+    # 兜底检测：较长摘要末尾停在半个词（无句末标点）
+    if len(text) >= 120 and text[-1] not in _END_PUNCT:
+        raise RuntimeError(
+            f"模型 {pid} 生成的摘要疑似中途戛然而止（末尾停在“{text[-10:]}”，可能受限于 max_tokens），已拒绝写回以保护原记录"
+        )
+
+
 def _normalize_contexts_for_chat(msgs: list[dict]) -> list[dict]:
     """将消息规范为严格 user/assistant 交替且以 assistant 结尾的上下文，便于末尾追加 user 总结指令。"""
     merged: list[dict] = []
@@ -929,7 +972,9 @@ class ConversationManagerPlugin(Star):
             resp = await prov.text_chat(**kwargs)
             text = getattr(resp, "completion_text", None) or getattr(resp, "result_chain", None)
             if isinstance(text, str) and text.strip():
-                return text.strip()
+                cleaned = text.strip()
+                _check_not_truncated(resp, cleaned, pid)
+                return cleaned
             raise RuntimeError(f"模型 {pid} 返回内容为空（可能触发了内容安全过滤）")
 
         # 第 1 步：当前模型首次尝试 + 3秒后当场重试
@@ -1000,12 +1045,20 @@ class ConversationManagerPlugin(Star):
         prefix_tag = "自动压缩" if is_auto else "手动压缩"
         try:
             keep = max(1, int(len(rounds) * ratio))
+            # 防止压缩保留的轮数本身仍高于自动压缩轮数上限，导致刚压完发一句话又连环触发二次压缩
+            auto_r_lim = int(self._cfg("auto_compress_rounds", 0) or 0)
+            if auto_r_lim > 0 and keep >= auto_r_lim:
+                keep = max(1, min(keep, int(auto_r_lim * 0.6)))
             old_rounds = rounds[:-keep]
             recent_rounds = rounds[-keep:]
-            old_msgs = sanitize_for_summary(flatten_rounds(old_rounds))
-            if not old_msgs:
+
+            # 若开头已有上一次压缩的长期记忆，独立剥离出来并在合并阶段强制增量继承，绝不丢弃早期记忆
+            prev_summary, new_old_rounds = _extract_prev_summary(old_rounds)
+            old_msgs = sanitize_for_summary(flatten_rounds(new_old_rounds))
+            if not old_msgs and not prev_summary:
                 raise RuntimeError("旧对话中没有可压缩的文本内容")
-            chunks = pack_chunks(old_msgs)
+
+            chunks = pack_chunks(old_msgs) if old_msgs else []
             job["total_chunks"] = len(chunks)
             summaries: list[str] = []
 
@@ -1015,7 +1068,7 @@ class ConversationManagerPlugin(Star):
                 ctx_msgs = _normalize_contexts_for_chat(chunk)
                 text, active_prov, active_id = await self._call_llm_with_retry_and_fallback(
                     job=job,
-                    prompt_text="请按系统要求，将以上历史对话总结为一份客观、连贯的中文摘要，直接输出正文。",
+                    prompt_text="请按系统要求，将以上历史对话总结为一份客观、连贯、完整的中文摘要，直接输出正文（务必写完整，不要中途截断）。",
                     stage_label=f"分块 {i}/{len(chunks)}",
                     active_provider=active_prov,
                     active_id=active_id,
@@ -1026,25 +1079,38 @@ class ConversationManagerPlugin(Star):
                 )
                 summaries.append(text)
 
-            if len(summaries) > 1:
-                job["progress"] = f"{prefix_tag}：合并 {len(summaries)} 份分块摘要（模型: {active_id}）"
+            # 组合「既有长期记忆（若有）」与「新产生的分块摘要」
+            all_parts: list[tuple[str, str]] = []
+            if prev_summary:
+                all_parts.append(("此前已存档的长期历史记忆（必须完整继承，严禁丢弃早期核心设定与重要事件）", prev_summary))
+            for idx_s, s in enumerate(summaries, 1):
+                all_parts.append((f"新增的第 {idx_s} 阶段对话摘要", s))
+
+            if len(all_parts) > 1:
+                job["progress"] = f"{prefix_tag}：增量融合 {len(all_parts)} 份历史摘要（模型: {active_id}）"
                 merge_ctx: list[dict] = []
-                for idx_s, s in enumerate(summaries, 1):
-                    merge_ctx.append({"role": "user", "content": f"第 {idx_s} 阶段对话摘要：\n{s}"})
-                    merge_ctx.append({"role": "assistant", "content": f"已收到第 {idx_s} 阶段摘要。"})
+                for label, body in all_parts:
+                    merge_ctx.append({"role": "user", "content": f"【{label}】\n{body}"})
+                    merge_ctx.append({"role": "assistant", "content": f"已完整记录{label}。"})
+                merge_sys = (
+                    f"{MERGE_INSTRUCTION}\n"
+                    f"同时请严格遵循用户的核心摘要要求：\n{instruction}\n"
+                    "【铁律】必须完整保留“此前已存档的长期历史记忆”中的关键人物、称呼、规矩设定与重要早期事件，"
+                    "并将后续新增阶段摘要按时间顺序自然衔接在后面，绝不可丢弃早期记忆，也不可中途截断。"
+                )
                 summary, active_prov, active_id = await self._call_llm_with_retry_and_fallback(
                     job=job,
-                    prompt_text="请将以上各阶段摘要按时间顺序合并为一份连贯的中文摘要，去除重复并保留所有关键信息，直接输出正文。",
-                    stage_label="合并分块摘要",
+                    prompt_text="请将以上既有长期记忆与后续新增摘要合并为一份完整、连贯的中文长期记忆，按时间顺序整合，直接输出正文。",
+                    stage_label="增量融合摘要",
                     active_provider=active_prov,
                     active_id=active_id,
                     fallback_provider=fallback_provider,
                     fallback_id=fallback_id,
                     contexts=merge_ctx,
-                    system_prompt=MERGE_INSTRUCTION,
+                    system_prompt=merge_sys,
                 )
             else:
-                summary = summaries[0]
+                summary = all_parts[0][1]
 
             # 写回前乐观锁校验：绝不覆盖压缩期间产生的新消息
             conv_now = await self._find_conv(cid)
