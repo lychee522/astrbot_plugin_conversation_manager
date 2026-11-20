@@ -1,16 +1,16 @@
 """AstrBot 对话管理插件（astrbot_plugin_conversation_manager）。
 
 在 Dashboard 左侧提供「对话管理」页面：可视化浏览 / 编辑 / 删除 / 插入
-任何平台会话的消息，支持自动快照撤销、JSONL 导入导出、手动分块压缩摘要。
+任何平台会话的消息（含模型 think 思考过程），支持自动快照撤销、JSONL 导入导出、
+手动与按阈值（轮数/字数/Token）自动分块压缩摘要（带当场重试、备用模型切换与延迟重试保命机制）。
 
 设计约束（全部对照 AstrBot 4.29.3 源码核对）：
 - 数据层只走官方 conversation_manager，不直接访问数据库，跨版本安全。
 - Web API 走 context.register_web_api，最终挂载在 /api/plug/<route>，
   由 dashboard 统一鉴权；handler 为 Quart view（**kwargs），query/body
   经全局 quart.request 读取。
-- 响应信封统一 {"success": True/False, "data"/"message"}：非标准信封会被
-  父级 SPA 原样透传，由前端自行解包（与官方 message_recorder/cost_control 一致）。
-- 任何 handler 异常都在内部消化，绝不影响 bot 主流程。
+- 响应信封统一 {"success": True/False, "data"/"message"}。
+- 任何 handler 异常都在内部消化，压缩失败绝不删改原历史记录，绝不影响 bot 主流程。
 """
 
 from __future__ import annotations
@@ -30,11 +30,14 @@ except Exception:  # pragma: no cover - 理论上不会发生
     _quart_request = None
 
 from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_conversation_manager"
 MAX_TEXT_PER_MSG_FOR_SUMMARY = 2400
 SUMMARY_CHUNK_CHARS = 24000
+AUTO_RETRY_INTERVAL_SEC = 300  # 自动压缩失败后等待 5 分钟再试
+AUTO_MAX_RETRIES = 3           # 自动压缩最多连续尝试 3 次
 
 DEFAULT_COMPRESS_INSTRUCTION = (
     "你是对话历史压缩器。请把下面的多轮对话压缩成一份第三人称中文摘要，用于替换原始历史作为长期记忆。"
@@ -48,24 +51,20 @@ MERGE_INSTRUCTION = (
 )
 ACK_TEXT = "Acknowledged the summary of our previous conversation history."
 
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\uff00-\uffef]")
+
 
 def _now_ts() -> int:
     return int(time.time())
 
 
-def est_tokens(history: list[dict]) -> int:
-    """粗略估算上下文 token（与 AstrBot EstimateTokenCounter 同量级）。"""
-    chars = 0
-    for m in history:
-        c = m.get("content")
-        if isinstance(c, str):
-            chars += len(c)
-        elif isinstance(c, list):
-            for p in c:
-                if isinstance(p, dict):
-                    chars += len(str(p.get("text") or p.get("think") or ""))
-        chars += 8
-    return int(chars / 4.5) + 4 * len(history)
+def _str_tokens(s: str) -> float:
+    """区分中英文估算单个字符串的 Token 数（贴合 DeepSeek/Qwen/OpenAI 分词器）。"""
+    if not s:
+        return 0.0
+    cjk = len(_CJK_RE.findall(s))
+    other = len(s) - cjk
+    return cjk * 0.65 + other * 0.25
 
 
 def split_rounds(history: list[dict]) -> list[list[dict]]:
@@ -90,8 +89,54 @@ def flatten_rounds(rounds: list[list[dict]]) -> list[dict]:
     return out
 
 
+def calc_stats(history: list[dict]) -> dict[str, int]:
+    """统一统计会话的轮数、正文字数、思考字数、总字数及包含思考内容的 Token 估算。"""
+    text_chars = 0
+    think_chars = 0
+    text_tok = 0.0
+    think_tok = 0.0
+
+    for m in history:
+        c = m.get("content")
+        if isinstance(c, str):
+            text_chars += len(c)
+            text_tok += _str_tokens(c)
+        elif isinstance(c, list):
+            for p in c:
+                if not isinstance(p, dict):
+                    continue
+                ptype = p.get("type")
+                if ptype == "think":
+                    th = str(p.get("think") or "")
+                    think_chars += len(th)
+                    think_tok += _str_tokens(th)
+                else:
+                    tx = str(p.get("text") or "")
+                    text_chars += len(tx)
+                    text_tok += _str_tokens(tx)
+
+    overhead = 4 * len(history)
+    text_tokens_int = int(round(text_tok)) + overhead
+    think_tokens_int = int(round(think_tok))
+    return {
+        "msg_count": len(history),
+        "rounds": len(split_rounds(history)),
+        "text_chars": text_chars,
+        "think_chars": think_chars,
+        "total_chars": text_chars + think_chars,
+        "text_tokens": text_tokens_int,
+        "think_tokens": think_tokens_int,
+        "est_tokens": text_tokens_int + think_tokens_int,
+    }
+
+
+def est_tokens(history: list[dict]) -> int:
+    """估算包含正文与 think 思考内容的总上下文 Token。"""
+    return calc_stats(history)["est_tokens"]
+
+
 def sanitize_for_summary(history: list[dict], max_chars: int = MAX_TEXT_PER_MSG_FOR_SUMMARY) -> list[dict]:
-    """抽取纯文本用于摘要请求（跳过图片/工具等非文本内容）。"""
+    """抽取纯文本用于摘要请求（跳过图片/工具/think等非对话正文内容）。"""
     out: list[dict] = []
     for m in history:
         role = m.get("role")
@@ -143,8 +188,8 @@ def validate_history(history: Any) -> tuple[bool, str]:
 @register(
     PLUGIN_NAME,
     "lychee522",
-    "对话可视化管理：浏览/编辑/删除/插入消息、自动快照撤销、JSONL 导入导出、手动分块压缩摘要",
-    "1.0.1",
+    "对话可视化管理：浏览/编辑/删除/插入消息與思考过程、自动快照撤销、JSONL 导入导出、手动与按阈值自动分块压缩摘要",
+    "1.1.0",
 )
 class ConversationManagerPlugin(Star):
     def __init__(self, context: Context, config=None) -> None:
@@ -153,15 +198,19 @@ class ConversationManagerPlugin(Star):
         self.config = config if config is not None else {}
         self._compress_jobs: dict[str, dict] = {}
         self._compress_tasks: dict[str, asyncio.Task] = {}
+        self._auto_check_tasks: dict[str, asyncio.Task] = {}
+        self._retry_timer_tasks: dict[str, asyncio.Task] = {}
+        # {cid: {"retry_count": int, "paused": bool, "last_error": str, "next_retry_at": int}}
+        self._auto_retry_state: dict[str, dict] = {}
 
     # ---------- helpers ----------
 
     def _cfg(self, key: str, default: Any) -> Any:
         try:
             v = self.config.get(key, default)
+            return default if v is None else v
         except Exception:
-            v = default
-        return v
+            return default
 
     def _snap_dir(self, cid: str) -> Path:
         safe = re.sub(r"[^A-Za-z0-9_-]", "_", cid)[:64] or "unknown"
@@ -197,6 +246,8 @@ class ConversationManagerPlugin(Star):
 
     async def _find_conv(self, cid: str):
         """按 cid 找对话（官方 API）。返回 Conversation 或 None。"""
+        if not cid:
+            return None
         convs = await self.context.conversation_manager.get_conversations()
         for c in convs:
             if getattr(c, "cid", None) == cid:
@@ -243,6 +294,62 @@ class ConversationManagerPlugin(Star):
         except Exception:
             return []
 
+    def _check_thresholds(self, stats: dict[str, int]) -> tuple[list[str], list[str]]:
+        """检查当前统计数据是否达到或接近任一限制条件。返回 (已达标原因列表, 接近80%原因列表)。"""
+        triggered: list[str] = []
+        warnings: list[str] = []
+
+        r_lim = int(self._cfg("auto_compress_rounds", 0) or 0)
+        c_lim = int(self._cfg("auto_compress_chars", 0) or 0)
+        t_lim = int(self._cfg("token_threshold", 12800) or 0)
+
+        if r_lim > 0:
+            if stats["rounds"] >= r_lim:
+                triggered.append(f"轮数 {stats['rounds']}/{r_lim} 轮")
+            elif stats["rounds"] >= r_lim * 0.8:
+                warnings.append(f"轮数接近上限 ({stats['rounds']}/{r_lim})")
+
+        if c_lim > 0:
+            if stats["total_chars"] >= c_lim:
+                triggered.append(f"字数 {stats['total_chars']}/{c_lim} 字")
+            elif stats["total_chars"] >= c_lim * 0.8:
+                warnings.append(f"字数接近上限 ({stats['total_chars']}/{c_lim})")
+
+        if t_lim > 0:
+            if stats["est_tokens"] >= t_lim:
+                triggered.append(f"Token ~{stats['est_tokens']}/{t_lim}")
+            elif stats["est_tokens"] >= t_lim * 0.8:
+                warnings.append(f"Token 接近上限 (~{stats['est_tokens']}/{t_lim})")
+
+        return triggered, warnings
+
+    async def _resolve_compress_providers(self, umo: str, override_primary_id: str = "") -> tuple[Any, str, Any, str]:
+        """解析首选压缩模型与备用兜底模型：(primary_inst, primary_id, fallback_inst, fallback_id)。"""
+        primary_id = (override_primary_id or str(self._cfg("auto_compress_provider", "") or "")).strip()
+        primary = self.context.get_provider_by_id(primary_id) if primary_id else None
+
+        if primary is None:
+            # 默认跟随当前对话模型
+            try:
+                get_async = getattr(self.context, "get_using_provider_async", None)
+                if callable(get_async):
+                    primary = await get_async(umo)
+                else:
+                    primary = self.context.get_using_provider(umo)
+            except Exception:
+                primary = None
+            if primary is not None:
+                cfg = getattr(primary, "provider_config", {}) or {}
+                primary_id = str(cfg.get("id") or "当前聊天模型")
+
+        fb_id = str(self._cfg("auto_compress_fallback_provider", "") or "").strip()
+        fallback = self.context.get_provider_by_id(fb_id) if fb_id else None
+        if fallback is primary or (fb_id and fb_id == primary_id):
+            fallback = None
+            fb_id = ""
+
+        return primary, primary_id, fallback, fb_id
+
     # ---------- lifecycle ----------
 
     async def initialize(self):
@@ -258,6 +365,7 @@ class ConversationManagerPlugin(Star):
             (f"{prefix}/snapshots/restore/<cid>", self.api_restore, ["POST"], "恢复快照"),
             (f"{prefix}/compress", self.api_compress, ["POST"], "手动压缩（后台执行）"),
             (f"{prefix}/compress/status/<cid>", self.api_compress_status, ["GET"], "压缩进度"),
+            (f"{prefix}/compress/reset/<cid>", self.api_compress_reset, ["POST"], "重置自动压缩暂停状态"),
             (f"{prefix}/providers", self.api_providers, ["GET"], "可用模型列表"),
             (f"{prefix}/status/<cid>", self.api_status, ["GET"], "上下文压力估算"),
             (f"{prefix}/config", self.api_config_get, ["GET"], "读取面板配置"),
@@ -268,8 +376,129 @@ class ConversationManagerPlugin(Star):
         logger.info("[对话管理] Web API 注册完成（/api/plug/%s/...）" % PLUGIN_NAME)
 
     async def terminate(self):
-        for t in self._compress_tasks.values():
-            t.cancel()
+        for task_dict in (self._compress_tasks, self._auto_check_tasks, self._retry_timer_tasks):
+            for t in task_dict.values():
+                t.cancel()
+
+    # ---------- Auto-compress event hook ----------
+
+    @filter.after_message_sent()
+    async def on_after_message_sent(self, event: AstrMessageEvent):
+        """每条回复发送完成后，若开启了自动压缩，延迟 2.5 秒检查是否达到压缩阈值。"""
+        try:
+            if not bool(self._cfg("auto_compress_enabled", False)):
+                return
+            umo = getattr(event, "unified_msg_origin", "") or ""
+            if not umo:
+                return
+            prev = self._auto_check_tasks.get(umo)
+            if prev and not prev.done():
+                prev.cancel()
+            self._auto_check_tasks[umo] = asyncio.create_task(
+                self._delayed_auto_check(umo, delay=2.5)
+            )
+        except Exception as e:
+            logger.debug(f"[对话管理] 自动压缩钩子异常（已忽略）: {e}")
+
+    async def _delayed_auto_check(self, umo: str, delay: float = 2.5) -> None:
+        try:
+            await asyncio.sleep(delay)
+            if not bool(self._cfg("auto_compress_enabled", False)):
+                return
+            cid = await self.context.conversation_manager.get_curr_conversation_id(umo)
+            if not cid:
+                return
+            await self._try_trigger_auto_compress(cid, umo)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning(f"[对话管理] 自动压缩检查失败: {e}")
+
+    async def _try_trigger_auto_compress(self, cid: str, umo: str, is_retry: bool = False) -> None:
+        if not bool(self._cfg("auto_compress_enabled", False)):
+            return
+        job = self._compress_jobs.get(cid)
+        if job and job.get("state") == "running":
+            return
+
+        rstate = self._auto_retry_state.get(cid) or {}
+        if rstate.get("paused"):
+            return
+        if not is_retry and rstate.get("next_retry_at", 0) > _now_ts():
+            return
+
+        conv = await self._find_conv(cid)
+        if not conv:
+            return
+        hist = self._load_history(conv)
+        stats = calc_stats(hist)
+        if stats["rounds"] < 4:
+            return
+
+        triggered, _ = self._check_thresholds(stats)
+        if not triggered:
+            return
+
+        primary, primary_id, fallback, fb_id = await self._resolve_compress_providers(umo)
+        if primary is None:
+            logger.warning(f"[对话管理] 会话 {cid[:8]}… 已达自动压缩阈值（{'、'.join(triggered)}），但未找到可用压缩模型")
+            return
+
+        ratio = float(self._cfg("compress_keep_ratio", 0.15))
+        ratio = min(0.5, max(0.0, ratio))
+        instruction = (self._cfg("compress_instruction", DEFAULT_COMPRESS_INSTRUCTION) or "").strip() or DEFAULT_COMPRESS_INSTRUCTION
+        reason_str = "、".join(triggered)
+        logger.info(
+            f"[对话管理] 会话 {cid[:8]}… 触发自动压缩（原因: {reason_str}，模型: {primary_id}"
+            + (f"，备用: {fb_id}" if fb_id else "")
+            + "）"
+        )
+        rounds = split_rounds(hist)
+        base_updated = getattr(conv, "updated_at", 0)
+        new_job = {
+            "state": "running",
+            "mode": "auto",
+            "trigger_reason": reason_str,
+            "cid": cid,
+            "started_at": _now_ts(),
+            "progress": f"自动压缩准备中（触发: {reason_str}）",
+            "total_chunks": 0,
+            "done_chunks": 0,
+        }
+        self._compress_jobs[cid] = new_job
+        task = asyncio.create_task(
+            self._run_compress(
+                cid=cid,
+                umo=umo,
+                provider=primary,
+                provider_id=primary_id,
+                fallback_provider=fallback,
+                fallback_id=fb_id,
+                hist=hist,
+                rounds=rounds,
+                ratio=ratio,
+                instruction=instruction,
+                base_updated=base_updated,
+                is_auto=True,
+            )
+        )
+        self._compress_tasks[cid] = task
+
+    def _schedule_delayed_retry(self, cid: str, umo: str, delay_sec: int = AUTO_RETRY_INTERVAL_SEC) -> None:
+        prev = self._retry_timer_tasks.get(cid)
+        if prev and not prev.done():
+            prev.cancel()
+
+        async def _timer():
+            try:
+                await asyncio.sleep(delay_sec)
+                await self._try_trigger_auto_compress(cid, umo, is_retry=True)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning(f"[对话管理] 延迟重试自动压缩异常: {e}")
+
+        self._retry_timer_tasks[cid] = asyncio.create_task(_timer())
 
     # ---------- API handlers ----------
 
@@ -279,6 +508,7 @@ class ConversationManagerPlugin(Star):
             items = []
             for c in convs:
                 hist = self._load_history(c)
+                st = calc_stats(hist)
                 items.append({
                     "cid": getattr(c, "cid", ""),
                     "user_id": getattr(c, "user_id", ""),
@@ -287,8 +517,11 @@ class ConversationManagerPlugin(Star):
                     "persona_id": getattr(c, "persona_id", None),
                     "created_at": getattr(c, "created_at", 0),
                     "updated_at": getattr(c, "updated_at", 0),
-                    "msg_count": len(hist),
-                    "est_tokens": est_tokens(hist),
+                    "msg_count": st["msg_count"],
+                    "rounds": st["rounds"],
+                    "total_chars": st["total_chars"],
+                    "think_chars": st["think_chars"],
+                    "est_tokens": st["est_tokens"],
                     "last_preview": self._preview(hist),
                 })
             items.sort(key=lambda x: x["updated_at"], reverse=True)
@@ -320,6 +553,7 @@ class ConversationManagerPlugin(Star):
             if not conv:
                 return self._err("对话不存在")
             hist = self._load_history(conv)
+            st = calc_stats(hist)
             return self._ok({
                 "cid": cid,
                 "user_id": getattr(conv, "user_id", ""),
@@ -330,8 +564,14 @@ class ConversationManagerPlugin(Star):
                 "updated_at": getattr(conv, "updated_at", 0),
                 "token_usage": getattr(conv, "token_usage", 0),
                 "history": hist,
-                "est_tokens": est_tokens(hist),
-                "rounds": len(split_rounds(hist)),
+                "est_tokens": st["est_tokens"],
+                "text_tokens": st["text_tokens"],
+                "think_tokens": st["think_tokens"],
+                "total_chars": st["total_chars"],
+                "text_chars": st["text_chars"],
+                "think_chars": st["think_chars"],
+                "rounds": st["rounds"],
+                "msg_count": st["msg_count"],
             })
         except Exception as e:
             return self._err(f"读取对话失败: {e}")
@@ -363,13 +603,16 @@ class ConversationManagerPlugin(Star):
                 conversation_id=cid,
                 history=history,
             )
-            new_hist = self._load_history(await self._find_conv(cid))
+            st = calc_stats(history)
             logger.info(f"[对话管理] 会话 {cid[:8]}… 已保存 {len(history)} 条消息（快照: {snap}）")
             return self._ok({
                 "snapshot": snap,
                 "updated_at": getattr(await self._find_conv(cid), "updated_at", 0),
-                "msg_count": len(history),
-                "est_tokens": est_tokens(history),
+                "msg_count": st["msg_count"],
+                "rounds": st["rounds"],
+                "total_chars": st["total_chars"],
+                "think_chars": st["think_chars"],
+                "est_tokens": st["est_tokens"],
             })
         except Exception as e:
             return self._err(f"保存失败: {e}")
@@ -435,12 +678,16 @@ class ConversationManagerPlugin(Star):
                 conversation_id=cid,
                 history=history,
             )
+            st = calc_stats(history)
             logger.info(f"[对话管理] 会话 {cid[:8]}… 已导入 {len(history)} 条消息（快照: {snap}）")
             return self._ok({
                 "snapshot": snap,
-                "msg_count": len(history),
+                "msg_count": st["msg_count"],
+                "rounds": st["rounds"],
+                "total_chars": st["total_chars"],
+                "think_chars": st["think_chars"],
                 "file_cid": file_cid,
-                "est_tokens": est_tokens(history),
+                "est_tokens": st["est_tokens"],
                 "updated_at": getattr(await self._find_conv(cid), "updated_at", 0),
             })
         except Exception as e:
@@ -521,109 +768,264 @@ class ConversationManagerPlugin(Star):
             if not conv:
                 return self._err("对话不存在")
             hist = self._load_history(conv)
-            est = est_tokens(hist)
-            threshold = int(self._cfg("token_threshold", 12800))
-            recent_lens = [len(self._msg_text(m)) for m in hist[-10:]]
-            avg = sum(recent_lens) / max(1, len(recent_lens))
-            chars_left = max(0, (threshold - est) * 4.5)
-            msgs_left = max(0, int(chars_left / max(1, avg)))
+            st = calc_stats(hist)
+            triggered, warnings = self._check_thresholds(st)
             return self._ok({
-                "est_tokens": est,
-                "threshold": threshold,
-                "msg_count": len(hist),
-                "rounds": len(split_rounds(hist)),
-                "est_msgs_left": msgs_left,
-                "will_trigger": est >= threshold,
+                **st,
+                "threshold": int(self._cfg("token_threshold", 12800) or 0),
+                "rounds_threshold": int(self._cfg("auto_compress_rounds", 0) or 0),
+                "chars_threshold": int(self._cfg("auto_compress_chars", 0) or 0),
+                "auto_compress_enabled": bool(self._cfg("auto_compress_enabled", False)),
+                "triggered_reasons": triggered,
+                "warn_reasons": warnings,
+                "will_trigger": len(triggered) > 0,
             })
         except Exception as e:
             return self._err(f"状态估算失败: {e}")
+
+    async def api_compress_reset(self, cid: str = "", **kwargs) -> dict:
+        """清除某个会话的自动压缩失败暂停状态。"""
+        self._auto_retry_state.pop(cid, None)
+        t = self._retry_timer_tasks.pop(cid, None)
+        if t and not t.done():
+            t.cancel()
+        if cid in self._compress_jobs and self._compress_jobs[cid].get("state") in ("error", "retry_wait"):
+            self._compress_jobs.pop(cid, None)
+        return self._ok({"reset": True})
 
     async def api_compress(self, **kwargs) -> dict:
         try:
             body = await self._body()
             cid = body.get("cid")
-            provider_id = body.get("provider_id")
-            if not cid or not provider_id:
-                return self._err("缺少 cid 或 provider_id")
+            provider_id = (body.get("provider_id") or "").strip()
+            fallback_id = (body.get("fallback_provider_id") or "").strip()
+            if not cid:
+                return self._err("缺少 cid")
             conv = await self._find_conv(cid)
             if not conv:
                 return self._err("对话不存在")
-            provider = self.context.get_provider_by_id(provider_id)
-            if provider is None:
-                return self._err(f"模型 {provider_id} 不存在或未启用")
+            umo = getattr(conv, "user_id", "")
+
+            primary, resolved_primary_id, default_fb, default_fb_id = await self._resolve_compress_providers(
+                umo, override_primary_id=provider_id
+            )
+            if primary is None:
+                return self._err(f"模型 {provider_id or '默认聊天模型'} 不存在或未启用")
+
+            if fallback_id:
+                fb_provider = self.context.get_provider_by_id(fallback_id)
+                fb_id = fallback_id if fb_provider else ""
+            else:
+                fb_provider, fb_id = default_fb, default_fb_id
+            if fb_provider is primary or (fb_id and fb_id == resolved_primary_id):
+                fb_provider, fb_id = None, ""
+
             hist = self._load_history(conv)
             rounds = split_rounds(hist)
             if len(rounds) < 4:
-                return self._err("对话轮次太少，无需压缩")
+                return self._err("对话轮次太少（不足 4 轮），无需压缩")
             if cid in self._compress_jobs and self._compress_jobs[cid].get("state") == "running":
-                return self._err("该会话已有压缩任务在执行")
+                return self._err("该会话已有压缩任务在后台执行")
+
+            # 手动触发压缩时清除之前的自动重试/暂停状态
+            self._auto_retry_state.pop(cid, None)
+            prev_timer = self._retry_timer_tasks.pop(cid, None)
+            if prev_timer and not prev_timer.done():
+                prev_timer.cancel()
+
             ratio = float(body.get("keep_ratio", self._cfg("compress_keep_ratio", 0.15)))
-            ratio = min(0.3, max(0.0, ratio))
-            instruction = (body.get("instruction") or self._cfg(
-                "compress_instruction", DEFAULT_COMPRESS_INSTRUCTION)) or DEFAULT_COMPRESS_INSTRUCTION
+            ratio = min(0.5, max(0.0, ratio))
+            instruction = (
+                body.get("instruction")
+                or self._cfg("compress_instruction", DEFAULT_COMPRESS_INSTRUCTION)
+                or DEFAULT_COMPRESS_INSTRUCTION
+            ).strip() or DEFAULT_COMPRESS_INSTRUCTION
+
             job = {
                 "state": "running",
+                "mode": "manual",
                 "cid": cid,
                 "started_at": _now_ts(),
-                "progress": "准备中",
+                "progress": f"准备中（使用模型: {resolved_primary_id}）",
                 "total_chunks": 0,
                 "done_chunks": 0,
             }
             self._compress_jobs[cid] = job
             base_updated = getattr(conv, "updated_at", 0)
             task = asyncio.create_task(
-                self._run_compress(cid, provider, provider_id, hist, rounds, ratio, instruction, base_updated)
+                self._run_compress(
+                    cid=cid,
+                    umo=umo,
+                    provider=primary,
+                    provider_id=resolved_primary_id,
+                    fallback_provider=fb_provider,
+                    fallback_id=fb_id,
+                    hist=hist,
+                    rounds=rounds,
+                    ratio=ratio,
+                    instruction=instruction,
+                    base_updated=base_updated,
+                    is_auto=False,
+                )
             )
             self._compress_tasks[cid] = task
-            return self._ok({"started": True, "rounds": len(rounds), "msg_count": len(hist)})
+            return self._ok({
+                "started": True,
+                "provider_id": resolved_primary_id,
+                "fallback_id": fb_id,
+                "rounds": len(rounds),
+                "msg_count": len(hist),
+            })
         except Exception as e:
             return self._err(f"启动压缩失败: {e}")
 
-    async def _run_compress(self, cid: str, provider, provider_id: str,
-                            hist: list[dict], rounds: list[list[dict]],
-                            ratio: float, instruction: str, base_updated: int) -> None:
+    async def _call_llm_with_retry_and_fallback(
+        self,
+        job: dict,
+        prompt_text: str,
+        stage_label: str,
+        active_provider: Any,
+        active_id: str,
+        fallback_provider: Any,
+        fallback_id: str,
+    ) -> tuple[str, Any, str]:
+        """调用大模型生成摘要：
+        1. 首选模型失败时，等待 3 秒当场重试 1 次；
+        2. 若仍失败且配置了备用兜底模型，自动切换到备用模型（同样带当场重试）；
+        返回 (summary_text, current_active_provider, current_active_id)。
+        """
+        async def _try_once(prov, pid: str) -> str:
+            resp = await prov.text_chat(
+                prompt=prompt_text,
+                request_max_retries=1,
+            )
+            text = getattr(resp, "completion_text", None) or getattr(resp, "result_chain", None)
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+            raise RuntimeError(f"模型 {pid} 返回内容为空（可能触发了内容安全过滤）")
+
+        # 第 1 步：当前模型首次尝试 + 3秒后当场重试
+        first_err: Exception | None = None
+        try:
+            text = await _try_once(active_provider, active_id)
+            return text, active_provider, active_id
+        except asyncio.CancelledError:
+            raise
+        except Exception as e1:
+            first_err = e1
+            logger.warning(f"[对话管理] {stage_label} 模型 {active_id} 首次调用失败: {e1}，3 秒后当场重试…")
+            job["progress"] = f"{stage_label}（{active_id} 响应异常，3 秒后当场重试…）"
+            await asyncio.sleep(3)
+            try:
+                text = await _try_once(active_provider, active_id)
+                return text, active_provider, active_id
+            except asyncio.CancelledError:
+                raise
+            except Exception as e2:
+                first_err = e2
+
+        # 第 2 步：自动切换到备用兜底模型
+        if fallback_provider is not None and fallback_provider is not active_provider:
+            logger.warning(
+                f"[对话管理] {stage_label} 首选模型 {active_id} 重试仍失败({first_err})，"
+                f"正在自动切换备用模型 {fallback_id}…"
+            )
+            job["progress"] = f"{stage_label}（首选模型失败，已切换备用模型 {fallback_id} 继续…）"
+            try:
+                text = await _try_once(fallback_provider, fallback_id)
+                return text, fallback_provider, fallback_id
+            except asyncio.CancelledError:
+                raise
+            except Exception as fb_err1:
+                logger.warning(f"[对话管理] 备用模型 {fallback_id} 首次调用失败: {fb_err1}，3 秒后重试…")
+                await asyncio.sleep(3)
+                try:
+                    text = await _try_once(fallback_provider, fallback_id)
+                    return text, fallback_provider, fallback_id
+                except asyncio.CancelledError:
+                    raise
+                except Exception as fb_err2:
+                    raise RuntimeError(
+                        f"首选模型({active_id})失败: {first_err}；备用模型({fallback_id})也失败: {fb_err2}"
+                    )
+
+        raise RuntimeError(f"模型({active_id})请求失败: {first_err}")
+
+    async def _run_compress(
+        self,
+        cid: str,
+        umo: str,
+        provider: Any,
+        provider_id: str,
+        fallback_provider: Any,
+        fallback_id: str,
+        hist: list[dict],
+        rounds: list[list[dict]],
+        ratio: float,
+        instruction: str,
+        base_updated: int,
+        is_auto: bool = False,
+    ) -> None:
         job = self._compress_jobs[cid]
+        active_prov = provider
+        active_id = provider_id
+        prefix_tag = "自动压缩" if is_auto else "手动压缩"
         try:
             keep = max(1, int(len(rounds) * ratio))
             old_rounds = rounds[:-keep]
             recent_rounds = rounds[-keep:]
             old_msgs = sanitize_for_summary(flatten_rounds(old_rounds))
+            if not old_msgs:
+                raise RuntimeError("旧对话中没有可压缩的文本内容")
             chunks = pack_chunks(old_msgs)
             job["total_chunks"] = len(chunks)
             summaries: list[str] = []
+
             for i, chunk in enumerate(chunks, 1):
-                job["progress"] = f"分块摘要 {i}/{len(chunks)}"
+                job["progress"] = f"{prefix_tag}：分块摘要 {i}/{len(chunks)}（模型: {active_id}）"
                 job["done_chunks"] = i - 1
                 convo_text = "\n\n".join(
                     f"【{'用户' if m['role'] == 'user' else '助手'}】{m['content']}" for m in chunk
                 )
-                resp = await provider.text_chat(
-                    prompt=f"{instruction}\n\n===对话内容===\n{convo_text}",
-                    request_max_retries=1,
+                text, active_prov, active_id = await self._call_llm_with_retry_and_fallback(
+                    job=job,
+                    prompt_text=f"{instruction}\n\n===对话内容===\n{convo_text}",
+                    stage_label=f"分块 {i}/{len(chunks)}",
+                    active_provider=active_prov,
+                    active_id=active_id,
+                    fallback_provider=fallback_provider,
+                    fallback_id=fallback_id,
                 )
-                text = getattr(resp, "completion_text", None) or getattr(resp, "result_chain", None)
-                if isinstance(text, str) and text.strip():
-                    summaries.append(text.strip())
-                else:
-                    raise RuntimeError(f"分块 {i} 摘要返回为空")
+                summaries.append(text)
+
             if len(summaries) > 1:
-                job["progress"] = "合并分块摘要"
-                resp = await provider.text_chat(
-                    prompt=f"{MERGE_INSTRUCTION}\n\n" + "\n\n".join(
-                        f"===摘要 {i + 1}===\n{s}" for i, s in enumerate(summaries)
-                    ),
-                    request_max_retries=1,
+                job["progress"] = f"{prefix_tag}：合并 {len(summaries)} 份分块摘要（模型: {active_id}）"
+                merge_prompt = f"{MERGE_INSTRUCTION}\n\n" + "\n\n".join(
+                    f"===摘要 {i + 1}===\n{s}" for i, s in enumerate(summaries)
                 )
-                summary = getattr(resp, "completion_text", "")
-                if not str(summary).strip():
-                    raise RuntimeError("合并摘要返回为空")
+                summary, active_prov, active_id = await self._call_llm_with_retry_and_fallback(
+                    job=job,
+                    prompt_text=merge_prompt,
+                    stage_label="合并分块摘要",
+                    active_provider=active_prov,
+                    active_id=active_id,
+                    fallback_provider=fallback_provider,
+                    fallback_id=fallback_id,
+                )
             else:
                 summary = summaries[0]
 
-            # 写回前乐观校验
+            # 写回前乐观锁校验：绝不覆盖压缩期间产生的新消息
             conv_now = await self._find_conv(cid)
             if conv_now is None or int(getattr(conv_now, "updated_at", 0)) != int(base_updated):
-                raise RuntimeError("压缩期间会话有新消息，已安全中止（未做任何修改），请重新执行")
+                if is_auto:
+                    logger.info(f"[对话管理] 会话 {cid[:8]}… 自动压缩期间有新聊天消息进入，安全礼让中止（下一轮再压）")
+                    job.update({
+                        "state": "idle",
+                        "progress": "已礼让新消息",
+                    })
+                    return
+                raise RuntimeError("压缩期间会话有新消息进入，已安全中止（未改动任何记录），请刷新后重试")
 
             new_history = [
                 {"role": "user", "content": f"Our previous history conversation summary: {summary}"},
@@ -637,24 +1039,95 @@ class ConversationManagerPlugin(Star):
                 conversation_id=cid,
                 history=new_history,
             )
+
+            # 压缩成功：清空失败重试计数
+            self._auto_retry_state.pop(cid, None)
+            before_st = calc_stats(hist)
+            after_st = calc_stats(new_history)
             job.update({
                 "state": "done",
+                "mode": "auto" if is_auto else "manual",
+                "used_provider": active_id,
                 "progress": "完成",
                 "snapshot": snap,
                 "summary_preview": summary[:300],
-                "before": {"msg_count": len(hist), "est_tokens": est_tokens(hist)},
-                "after": {"msg_count": len(new_history), "est_tokens": est_tokens(new_history)},
+                "before": {
+                    "msg_count": before_st["msg_count"],
+                    "rounds": before_st["rounds"],
+                    "total_chars": before_st["total_chars"],
+                    "est_tokens": before_st["est_tokens"],
+                },
+                "after": {
+                    "msg_count": after_st["msg_count"],
+                    "rounds": after_st["rounds"],
+                    "total_chars": after_st["total_chars"],
+                    "est_tokens": after_st["est_tokens"],
+                },
             })
-            logger.info(f"[对话管理] 会话 {cid[:8]}… 压缩完成: {len(hist)} → {len(new_history)} 条（快照: {snap}）")
+            logger.info(
+                f"[对话管理] 会话 {cid[:8]}… {prefix_tag}成功（模型: {active_id}）: "
+                f"{before_st['msg_count']} → {after_st['msg_count']} 条, "
+                f"{before_st['total_chars']} → {after_st['total_chars']} 字, "
+                f"~{before_st['est_tokens']} → ~{after_st['est_tokens']} tok（快照: {snap}）"
+            )
         except asyncio.CancelledError:
-            job.update({"state": "error", "progress": "已取消", "error": "任务被取消"})
+            job.update({"state": "error", "progress": "已取消", "error": "压缩任务被取消（原记录未改动）"})
         except Exception as e:
-            logger.error(f"[对话管理] 压缩失败: {e}")
-            job.update({"state": "error", "progress": "失败", "error": str(e)})
+            err_msg = str(e)
+            logger.error(f"[对话管理] 会话 {cid[:8]}… {prefix_tag}失败（原聊天记录完好无损）: {err_msg}")
+            if is_auto:
+                rstate = self._auto_retry_state.setdefault(
+                    cid, {"retry_count": 0, "paused": False, "last_error": "", "next_retry_at": 0}
+                )
+                rstate["retry_count"] = int(rstate.get("retry_count", 0)) + 1
+                rstate["last_error"] = err_msg
+                cnt = rstate["retry_count"]
+                if cnt < AUTO_MAX_RETRIES:
+                    next_ts = _now_ts() + AUTO_RETRY_INTERVAL_SEC
+                    rstate["next_retry_at"] = next_ts
+                    job.update({
+                        "state": "retry_wait",
+                        "mode": "auto",
+                        "retry_count": cnt,
+                        "max_retries": AUTO_MAX_RETRIES,
+                        "next_retry_at": next_ts,
+                        "progress": f"自动压缩第 {cnt}/{AUTO_MAX_RETRIES} 次失败，5 分钟后自动重试",
+                        "error": (
+                            f"自动压缩第 {cnt}/{AUTO_MAX_RETRIES} 次失败（{err_msg}）。"
+                            "原聊天记录完好无损，系统将在 5 分钟后自动重试。"
+                        ),
+                    })
+                    self._schedule_delayed_retry(cid, umo, AUTO_RETRY_INTERVAL_SEC)
+                else:
+                    rstate["paused"] = True
+                    rstate["next_retry_at"] = 0
+                    job.update({
+                        "state": "error",
+                        "mode": "auto",
+                        "paused": True,
+                        "retry_count": cnt,
+                        "progress": "自动压缩连续失败 3 次已暂停",
+                        "error": (
+                            f"自动压缩连续 {AUTO_MAX_RETRIES} 次失败，已自动暂停（原因：{err_msg}）。"
+                            "原聊天记录完好无损！建议在左下角「⚙ 设置」中更换无审核的压缩模型或设置备用模型。"
+                        ),
+                    })
+            else:
+                job.update({
+                    "state": "error",
+                    "mode": "manual",
+                    "progress": "失败",
+                    "error": f"{err_msg}（原聊天记录完好无损，未做任何删改）",
+                })
 
     async def api_compress_status(self, cid: str = "", **kwargs) -> dict:
         job = self._compress_jobs.get(cid) or {"state": "idle"}
-        return self._ok({"job": {k: v for k, v in job.items() if k != "cid"}})
+        rstate = self._auto_retry_state.get(cid) or {}
+        out = {k: v for k, v in job.items() if k != "cid"}
+        if rstate.get("paused"):
+            out["paused"] = True
+            out.setdefault("error", rstate.get("last_error", "自动压缩已暂停"))
+        return self._ok({"job": out})
 
     async def api_config_get(self, **kwargs) -> dict:
         try:
@@ -662,8 +1135,14 @@ class ConversationManagerPlugin(Star):
                 "snapshot_keep": int(self._cfg("snapshot_keep", 20)),
                 "poll_interval": int(self._cfg("poll_interval", 5)),
                 "token_threshold": int(self._cfg("token_threshold", 12800)),
+                "auto_compress_enabled": bool(self._cfg("auto_compress_enabled", False)),
+                "auto_compress_rounds": int(self._cfg("auto_compress_rounds", 0)),
+                "auto_compress_chars": int(self._cfg("auto_compress_chars", 0)),
+                "auto_compress_provider": str(self._cfg("auto_compress_provider", "") or ""),
+                "auto_compress_fallback_provider": str(self._cfg("auto_compress_fallback_provider", "") or ""),
                 "compress_keep_ratio": float(self._cfg("compress_keep_ratio", 0.15)),
-                "compress_instruction": self._cfg("compress_instruction", DEFAULT_COMPRESS_INSTRUCTION),
+                "compress_instruction": str(self._cfg("compress_instruction", "") or ""),
+                "default_compress_instruction": DEFAULT_COMPRESS_INSTRUCTION,
             })
         except Exception as e:
             return self._err(f"读取配置失败: {e}")
@@ -672,17 +1151,34 @@ class ConversationManagerPlugin(Star):
         try:
             body = await self._body()
             allowed = {
-                "snapshot_keep": int, "poll_interval": int, "token_threshold": int,
-                "compress_keep_ratio": float, "compress_instruction": str,
+                "snapshot_keep": int,
+                "poll_interval": int,
+                "token_threshold": int,
+                "auto_compress_enabled": bool,
+                "auto_compress_rounds": int,
+                "auto_compress_chars": int,
+                "auto_compress_provider": str,
+                "auto_compress_fallback_provider": str,
+                "compress_keep_ratio": float,
+                "compress_instruction": str,
             }
             changed = {}
             for k, cast in allowed.items():
                 if k in body:
                     try:
-                        self.config[k] = cast(body[k])
+                        val = body[k]
+                        if cast is bool:
+                            self.config[k] = bool(val)
+                        else:
+                            self.config[k] = cast(val)
                         changed[k] = self.config[k]
                     except Exception:
                         return self._err(f"配置项 {k} 类型错误")
+            # 修改设置后重置所有会话的自动压缩失败暂停状态，让新配置立即生效
+            self._auto_retry_state.clear()
+            for cid_k, j in list(self._compress_jobs.items()):
+                if j.get("state") in ("error", "retry_wait") and j.get("mode") == "auto":
+                    self._compress_jobs.pop(cid_k, None)
             try:
                 save = getattr(self.config, "save_config", None)
                 if callable(save):

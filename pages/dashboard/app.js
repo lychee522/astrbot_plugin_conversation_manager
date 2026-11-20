@@ -5,6 +5,13 @@
 
   const PN = "/astrbot_plugin_conversation_manager";
   const PAGE_SIZE = 80;
+  const CJK_RE = /[\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\uff00-\uffef]/g;
+
+  const DEFAULT_INSTR_FALLBACK =
+    "你是对话历史压缩器。请把下面的多轮对话压缩成一份第三人称中文摘要，用于替换原始历史作为长期记忆。" +
+    "必须保留：人物关系与固定称呼、关键事件与大致时间线、双方做出的约定与承诺、" +
+    "重要的情绪转折、以及尚未回收的伏笔与悬而未决的话题。" +
+    "不要发表评论，不要使用 Markdown 标题符号，直接输出摘要正文。";
 
   const state = {
     convs: [],
@@ -18,8 +25,14 @@
       snapshot_keep: 20,
       poll_interval: 5,
       token_threshold: 12800,
+      auto_compress_enabled: false,
+      auto_compress_rounds: 0,
+      auto_compress_chars: 0,
+      auto_compress_provider: "",
+      auto_compress_fallback_provider: "",
       compress_keep_ratio: 0.15,
       compress_instruction: "",
+      default_compress_instruction: DEFAULT_INSTR_FALLBACK,
     },
     providers: [],
     pollTimer: null,
@@ -29,8 +42,6 @@
   const $ = (sel) => document.querySelector(sel);
 
   // ---------- API ----------
-  // 网络层：bridge 优先（官方机制，页面在 sandbox iframe 内为 opaque origin，
-  // 直接 fetch 会被 CORS 拦截），fetch 仅作兜底；两路失败都把原因显示出来。
   const AP = window.AstrBotPluginPage;
   function unwrap(r) {
     if (r && r.success === false) {
@@ -48,7 +59,6 @@
   }
   async function viaBridge(ep, params, body, isPost) {
     if (!AP || typeof AP.apiGet !== "function") throw new Error("bridge 不可用（SDK 未加载）");
-    // 父级自动拼 /api/v1/plugins/extensions/<插件名>/<endpoint>，endpoint 不能再带插件名前缀
     const sub = String(ep).replace(/^\/+/, "");
     if (isPost) return await withTimeout(AP.apiPost(sub, body || {}), 30000, "bridge POST");
     return await withTimeout(AP.apiGet(sub, params || {}), 15000, "bridge GET");
@@ -82,7 +92,7 @@
       return unwrap(await viaBridge(ep, params, body, isPost));
     } catch (e) {
       bridgeErr = e;
-      if (e && e.extra) throw e; // 业务错误（success:false）直接抛，不重试
+      if (e && e.extra) throw e;
     }
     try {
       return unwrap(await viaFetch(ep, params, body, isPost));
@@ -109,6 +119,67 @@
     const p = (n) => String(n).padStart(2, "0");
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   }
+  function fmtWan(n) {
+    const num = Number(n) || 0;
+    if (num >= 10000) return (num / 10000).toFixed(1).replace(/\.0$/, "") + "万";
+    return String(num);
+  }
+  function strTokens(s) {
+    if (!s) return 0;
+    const str = String(s);
+    const m = str.match(CJK_RE);
+    const cjk = m ? m.length : 0;
+    const other = str.length - cjk;
+    return cjk * 0.65 + other * 0.25;
+  }
+  function calcStats(hist) {
+    let textChars = 0;
+    let thinkChars = 0;
+    let textTok = 0;
+    let thinkTok = 0;
+    let rounds = 0;
+    let inRound = false;
+
+    for (const m of hist) {
+      if (!m) continue;
+      if (m.role === "user" && inRound) {
+        rounds++;
+      }
+      inRound = true;
+      const c = m.content;
+      if (typeof c === "string") {
+        textChars += c.length;
+        textTok += strTokens(c);
+      } else if (Array.isArray(c)) {
+        for (const p of c) {
+          if (!p || typeof p !== "object") continue;
+          if (p.type === "think") {
+            const th = String(p.think || "");
+            thinkChars += th.length;
+            thinkTok += strTokens(th);
+          } else {
+            const tx = String(p.text || "");
+            textChars += tx.length;
+            textTok += strTokens(tx);
+          }
+        }
+      }
+    }
+    if (inRound) rounds++;
+    const overhead = 4 * hist.length;
+    const textTokensInt = Math.round(textTok) + overhead;
+    const thinkTokensInt = Math.round(thinkTok);
+    return {
+      msg_count: hist.length,
+      rounds,
+      text_chars: textChars,
+      think_chars: thinkChars,
+      total_chars: textChars + thinkChars,
+      text_tokens: textTokensInt,
+      think_tokens: thinkTokensInt,
+      est_tokens: textTokensInt + thinkTokensInt,
+    };
+  }
   function extractTime(m) {
     const parts = m && m.content;
     const texts = [];
@@ -128,7 +199,7 @@
       t = document.createElement("div");
       t.id = "__toast";
       t.style.cssText =
-        "position:fixed;top:14px;right:14px;z-index:9999;max-width:420px;padding:10px 14px;" +
+        "position:fixed;top:14px;right:14px;z-index:9999;max-width:440px;padding:10px 14px;" +
         "border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.3);font-size:13px;line-height:1.5;";
       document.body.appendChild(t);
     }
@@ -195,16 +266,22 @@
       $("#placeholder").classList.add("hidden");
       $("#editor").classList.remove("hidden");
       $("#ed-user").textContent = d.user_id || d.cid;
-      $("#ed-meta").textContent =
-        `${d.msg_count || state.history.length} 条 · ${fmtTs(d.updated_at)} · ${d.platform_id || ""}`;
+      updateHeaderMeta();
       hideBanner();
       updateSaveBar();
       renderTimeline({ forceBottom: true });
       renderGuard();
       renderConvList();
+      checkCompressJobOnce();
     } catch (e) {
       toast(e.message, true);
     }
+  }
+  function updateHeaderMeta() {
+    if (!state.current) return;
+    const d = state.current;
+    $("#ed-meta").textContent =
+      `${state.history.length} 条（${d.rounds || 0} 轮） · ${fmtTs(state.baseUpdatedAt)} · ${d.platform_id || ""}`;
   }
   async function reloadConv(silent) {
     if (!state.current) return;
@@ -225,11 +302,13 @@
     el.innerHTML = state.convs
       .map((c) => {
         const active = state.current && state.current.cid === c.cid ? "active" : "";
+        const charsStr = c.total_chars != null ? `${fmtWan(c.total_chars)}字` : "";
         return `<div class="conv-item ${active}" data-cid="${esc(c.cid)}">
           <div class="ci-title">${esc(c.title || c.user_id || c.cid)}</div>
           <div class="ci-sub">
-            <span>${c.msg_count} 条</span><span>~${c.est_tokens} tok</span>
-            <span>${esc((c.user_id || "").split(":").pop())}</span>
+            <span>${c.msg_count} 条/${c.rounds || "-"} 轮</span>
+            ${charsStr ? `<span>${charsStr}</span>` : ""}
+            <span>~${fmtWan(c.est_tokens)} tok</span>
             <span>${fmtTs(c.updated_at)}</span>
           </div>
         </div>`;
@@ -243,15 +322,61 @@
     });
   }
 
-  // ---------- render: timeline ----------
+  // ---------- render: timeline & guard ----------
   function renderGuard() {
     const g = $("#guard-card");
-    const est = state.current ? state.current.est_tokens : 0;
-    const th = state.settings.token_threshold;
+    if (!state.current) return;
+    const cur = state.current;
+    const s = state.settings;
+    const rounds = cur.rounds || 0;
+    const totalChars = cur.total_chars || 0;
+    const thinkChars = cur.think_chars || 0;
+    const estTok = cur.est_tokens || 0;
+
+    const rLim = parseInt(s.auto_compress_rounds, 10) || 0;
+    const cLim = parseInt(s.auto_compress_chars, 10) || 0;
+    const tLim = parseInt(s.token_threshold, 10) || 0;
+
+    const hit = [];
+    const warn = [];
+    if (rLim > 0) {
+      if (rounds >= rLim) hit.push(`轮数 ${rounds}/${rLim}`);
+      else if (rounds >= rLim * 0.8) warn.push(`轮数 ${rounds}/${rLim}`);
+    }
+    if (cLim > 0) {
+      if (totalChars >= cLim) hit.push(`字数 ${fmtWan(totalChars)}/${fmtWan(cLim)}`);
+      else if (totalChars >= cLim * 0.8) warn.push(`字数 ${fmtWan(totalChars)}/${fmtWan(cLim)}`);
+    }
+    if (tLim > 0) {
+      if (estTok >= tLim) hit.push(`Token ~${fmtWan(estTok)}/${fmtWan(tLim)}`);
+      else if (estTok >= tLim * 0.8) warn.push(`Token ~${fmtWan(estTok)}/${fmtWan(tLim)}`);
+    }
+
     g.classList.remove("warn", "danger");
-    if (est >= th) { g.classList.add("danger"); g.textContent = `⚠ 上下文 ~${est} / ${th} tok，可能触发自动压缩`; }
-    else if (est >= th * 0.8) { g.classList.add("warn"); g.textContent = `上下文 ~${est} / ${th} tok，接近阈值`; }
-    else { g.textContent = `上下文 ~${est} / ${th} tok`; }
+    const thinkNote = thinkChars > 0 ? `（含思考 ${fmtWan(thinkChars)}字）` : "";
+    const autoBadge = s.auto_compress_enabled ? " · 自动压缩:开" : "";
+    const baseSummary = `共 ${rounds} 轮 · ${fmtWan(totalChars)}字${thinkNote} · ~${fmtWan(estTok)} tok${autoBadge}`;
+
+    if (hit.length) {
+      g.classList.add("danger");
+      g.textContent = `⚠ ${baseSummary}（已达阈值: ${hit.join("、")}）`;
+    } else if (warn.length) {
+      g.classList.add("warn");
+      g.textContent = `${baseSummary}（接近阈值: ${warn.join("、")}）`;
+    } else {
+      g.textContent = baseSummary;
+    }
+
+    const limDesc = [
+      rLim > 0 ? `轮数上限: ${rLim} 轮` : "轮数: 不限",
+      cLim > 0 ? `字数上限: ${cLim} 字` : "字数: 不限",
+      tLim > 0 ? `Token 上限: ${tLim} tok` : "Token: 不限",
+    ].join(" ｜ ");
+    g.title =
+      `对话正文字数: ${(cur.text_chars || 0).toLocaleString()} 字\n` +
+      `AI 思考字数: ${thinkChars.toLocaleString()} 字\n` +
+      `总计字数: ${totalChars.toLocaleString()} 字（约 ${estTok.toLocaleString()} Token，含思考内容）\n` +
+      `当前限制（${s.auto_compress_enabled ? "已开启自动压缩" : "仅预警，未开自动压缩"}）：${limDesc}`;
   }
 
   // 系统提醒仅在消息头显示时间，气泡内不再渲染；think 思考过程以折叠条展示
@@ -311,8 +436,7 @@
       const readonly = role === "system" ? "readonly" : "";
       html += `<div class="msg-row ${role}" data-i="${i}"><div class="msg-body"><div class="msg-head"><span class="msg-idx">#${i}</span><span>${role === "user" ? "用户" : role === "assistant" ? "助手" : esc(m.role)}</span>${t ? `<span>${esc(t)}</span>` : ""}</div><div class="bubble ${sel} ${readonly}" data-act="select" data-i="${i}">${renderBubbleInner(m)}</div></div><div class="msg-ops"><button class="btn" data-act="edit" data-i="${i}" title="编辑">✏ 编辑</button><button class="btn" data-act="del" data-i="${i}" title="删除此条">🗑 删</button>${role === "user" ? `<button class="btn" data-act="delround" data-i="${i}" title="删除这一轮（含回复）">⏬ 删轮</button>` : ""}<button class="btn" data-act="insert" data-i="${i}" title="在此后插入">➕ 插入</button><button class="btn" data-act="trunc" data-i="${i}" title="截断：保留到这条为止">✂ 截断</button></div></div>`;
     }
-    const inner = start > 0 ? `<div class="timeline-inner">${html}</div>` : `<div class="timeline-inner">${html}</div>`;
-    tl.innerHTML = inner;
+    tl.innerHTML = `<div class="timeline-inner">${html}</div>`;
     tl.querySelectorAll("details.think").forEach((d) => {
       d.addEventListener("click", (ev) => ev.stopPropagation());
     });
@@ -347,23 +471,13 @@
   }
 
   // ---------- local edit ops ----------
-  function calcEstTokens(hist) {
-    let chars = 0;
-    for (const m of hist) {
-      const c = m && m.content;
-      if (typeof c === "string") chars += c.length;
-      else if (Array.isArray(c)) {
-        for (const p of c) {
-          if (p && typeof p === "object") chars += String(p.text || p.think || "").length;
-        }
-      }
-      chars += 8;
-    }
-    return Math.floor(chars / 4.5) + 4 * hist.length;
-  }
   function markDirty() {
     state.dirty = true;
-    if (state.current) state.current.est_tokens = calcEstTokens(state.history);
+    if (state.current) {
+      const st = calcStats(state.history);
+      Object.assign(state.current, st);
+      updateHeaderMeta();
+    }
     updateSaveBar();
   }
   function updateSaveBar() {
@@ -394,8 +508,8 @@
       <div class="field"><label>角色</label>
         <select id="ins-role"><option value="user">用户</option><option value="assistant">助手</option></select>
       </div>
-      <div class="field"><label>💭 思考过程（可选，留空则无思考过程）</label><textarea id="ins-think" placeholder="可选：输入模型思考过程（think）" style="min-height:80px"></textarea></div>
-      <div class="field"><label>内容（文本）</label><textarea id="ins-text" placeholder="输入消息文本"></textarea></div>
+      <div class="field"><label>💭 思考过程（可选，留空则无思考过程）</label><textarea id="ins-think" placeholder="可选：输入模型思考过程（think），留空则不添加" style="min-height:80px"></textarea></div>
+      <div class="field"><label>内容（文本）</label><textarea id="ins-text" placeholder="在此输入消息正文文本"></textarea></div>
     `, '<button class="btn" data-close>取消</button><button class="btn primary" id="ins-ok">插入</button>');
     m.querySelector("#ins-ok").onclick = () => {
       const role = m.querySelector("#ins-role").value;
@@ -426,13 +540,13 @@
     let partsHtml = "";
     if (stringMode) {
       partsHtml = `<div class="field"><label>回复/消息内容（文本）</label>
-        <textarea class="edit-t" data-p="0">${esc(c)}</textarea></div>`;
+        <textarea class="edit-t" data-p="0" placeholder="输入消息正文内容">${esc(c)}</textarea></div>`;
     } else if (Array.isArray(c)) {
       let ti = 0;
       c.forEach((p, pi) => {
         if (p && p.type === "text") {
           partsHtml += `<div class="field"><label>文本片段 #${ti}（part ${pi}）</label>
-            <textarea class="edit-t" data-p="${pi}">${esc(p.text || "")}</textarea></div>`;
+            <textarea class="edit-t" data-p="${pi}" placeholder="输入消息正文内容">${esc(p.text || "")}</textarea></div>`;
           ti++;
         }
       });
@@ -451,7 +565,7 @@
         </select>
       </div>
       <div class="field"><label>💭 思考过程（think · 留空表示无/删除思考过程）</label>
-        <textarea id="ed-think" placeholder="无思考过程（可在此输入新增，或清空以删除原思考过程）" style="min-height:95px">${esc(existingThink)}</textarea>
+        <textarea id="ed-think" placeholder="当前无思考过程（可在此直接输入新增，或把已有内容清空以删除思考过程）" style="min-height:95px">${esc(existingThink)}</textarea>
       </div>
       <div class="edit-area">${partsHtml}</div>
     `, '<button class="btn" data-close>取消</button><button class="btn primary" id="ed-ok">应用（本地，稍后统一保存）</button>');
@@ -505,9 +619,9 @@
       state.baseUpdatedAt = d.updated_at != null ? d.updated_at : state.baseUpdatedAt;
       state.dirty = false;
       updateSaveBar();
-      state.current.est_tokens = d.est_tokens;
-      $("#ed-meta").textContent =
-        `${state.history.length} 条 · ${fmtTs(state.baseUpdatedAt)} · ${state.current.platform_id || ""}`;
+      const st = calcStats(state.history);
+      Object.assign(state.current, st, d);
+      updateHeaderMeta();
       renderGuard();
       toast(`已保存 ${d.msg_count} 条${d.snapshot ? `（快照 ${d.snapshot}）` : ""}`);
       loadList();
@@ -545,7 +659,7 @@
             </div>
             <button class="btn" data-restore="${esc(s.name)}">恢复</button>
           </div>`).join("")
-      : '<div class="muted small">暂无快照（每次保存/导入/压缩前会自动创建）</div>';
+      : '<div class="muted small">暂无快照（每次保存/导入/手动或自动压缩前会自动创建）</div>';
     const m = openModal("快照管理", listHtml);
     m.querySelectorAll("[data-restore]").forEach((b) => {
       b.onclick = async () => {
@@ -576,7 +690,7 @@
   }
   function importModal() {
     const m = openModal("导入 JSONL（整段替换当前对话）", `
-      <div class="banner" style="margin:-4px 0 12px">⚠ 导入会整段替换当前对话内容（替换前自动快照，可回滚）</div>
+      <div class="banner" style="margin:-4px 0 12px">⚠ 导入会整段替换当前对话内容（替换前自动快照，可随时回滚）</div>
       <div class="field"><label>选择 .jsonl 文件</label><input type="file" id="imp-file" accept=".jsonl,.json,.txt" /></div>
       <div class="field"><label>或直接粘贴 JSONL 内容</label><textarea id="imp-text" placeholder='{"cid": "...", "content": [...]} 每行一条记录'></textarea></div>
     `, '<button class="btn" data-close>取消</button><button class="btn primary" id="imp-ok">校验并导入</button>');
@@ -599,38 +713,109 @@
   }
 
   // ---------- compress ----------
-  function compressModal() {
-    if (!state.providers.length) {
-      toast("未读到可用模型，请检查 AstrBot 模型提供商配置", true);
-      return;
+  function buildProviderOptions(selectedId, firstLabel) {
+    let html = `<option value="" ${!selectedId ? "selected" : ""}>${esc(firstLabel)}</option>`;
+    for (const p of state.providers) {
+      const sel = p.id === selectedId ? "selected" : "";
+      html += `<option value="${esc(p.id)}" ${sel}>${esc(p.id)}${p.model ? " · " + esc(p.model) : ""}</option>`;
     }
-    const opts = state.providers
-      .map((p) => `<option value="${esc(p.id)}">${esc(p.id)}${p.model ? " · " + esc(p.model) : ""}</option>`)
-      .join("");
-    const m = openModal("手动压缩对话历史", `
-      <div class="banner" style="margin:-4px 0 12px">把旧对话交给所选模型生成摘要后替换（压缩前自动快照）。内容敏感时请选择无审核的本地模型。</div>
-      <div class="field"><label>用于压缩的模型</label><select id="cp-provider">${opts}</select></div>
-      <div class="row2">
-        <div class="field"><label>保留最近比例（0~0.3）</label><input id="cp-ratio" type="number" step="0.05" min="0" max="0.3" value="${state.settings.compress_keep_ratio}" /></div>
-        <div class="field"><label>当前轮次</label><input type="text" value="${(state.current && state.current.rounds) || "-"} 条（只读）" readonly /></div>
+    return html;
+  }
+
+  function compressModal() {
+    const s = state.settings;
+    const primaryOpts = buildProviderOptions(s.auto_compress_provider, "🌟 默认（跟随当前聊天模型）");
+    const fbOpts = buildProviderOptions(s.auto_compress_fallback_provider, "不使用备用模型");
+    const defaultInstr = s.default_compress_instruction || DEFAULT_INSTR_FALLBACK;
+    const cur = state.current || {};
+    const m = openModal("立即手动压缩对话历史", `
+      <div class="banner" style="margin:-4px 0 12px">
+        把旧对话浓缩为摘要并替换历史头部（压缩前自动创建快照；若因审核/断网失败，原聊天记录完好无损，绝不强行删除）。
       </div>
-      <div class="field"><label>摘要指令</label><textarea id="cp-instr">${esc(state.settings.compress_instruction || "")}</textarea></div>
-      <div class="muted small">大历史会自动分块摘要再合并；压缩在服务器后台执行，可关闭本窗口后继续聊天。</div>
-    `, '<button class="btn" data-close>取消</button><button class="btn primary" id="cp-ok">开始压缩</button>');
+      <div class="row2">
+        <div class="field">
+          <label>首选压缩模型</label>
+          <select id="cp-provider">${primaryOpts}</select>
+          <div class="field-hint">默认用当前聊天模型；内容敏感建议选无审核模型</div>
+        </div>
+        <div class="field">
+          <label>备用兜底模型（可选）</label>
+          <select id="cp-fb-provider">${fbOpts}</select>
+          <div class="field-hint">首选模型报错或被审核拦截时自动顶上</div>
+        </div>
+      </div>
+      <div class="row2">
+        <div class="field">
+          <label>保留最近多少比例不压缩（0 ~ 0.5）</label>
+          <input id="cp-ratio" type="number" step="0.05" min="0" max="0.5" value="${s.compress_keep_ratio}" placeholder="例：填 0.15 代表保留最近 15% 的原对话" />
+          <div class="field-hint">例：填 0.15 代表保留最近 15% 的完整对话，压缩前 85%</div>
+        </div>
+        <div class="field">
+          <label>当前会话统计（只读）</label>
+          <input type="text" value="共 ${cur.rounds || 0} 轮 · ${fmtWan(cur.total_chars || 0)}字 · ~${fmtWan(cur.est_tokens || 0)} tok" readonly />
+          <div class="field-hint">含思考过程 ${fmtWan(cur.think_chars || 0)} 字</div>
+        </div>
+      </div>
+      <div class="field">
+        <label>摘要提示词（留空则使用框内显示的默认提示词）</label>
+        <textarea id="cp-instr" placeholder="默认提示词：${esc(defaultInstr)}">${esc(s.compress_instruction || "")}</textarea>
+        <div class="field-hint">可在此写明需要重点保留的人物称呼、说话风格、场景设定与未完伏笔</div>
+      </div>
+    `, '<button class="btn" data-close>取消</button><button class="btn primary" id="cp-ok">开始后台压缩</button>');
     m.querySelector("#cp-ok").onclick = async () => {
       const provider_id = m.querySelector("#cp-provider").value;
-      const keep_ratio = parseFloat(m.querySelector("#cp-ratio").value) || 0.15;
+      const fallback_provider_id = m.querySelector("#cp-fb-provider").value;
+      const keep_ratio = parseFloat(m.querySelector("#cp-ratio").value);
       const instruction = m.querySelector("#cp-instr").value;
       closeModal();
       try {
         await apiPost("/compress", {
-          cid: state.current.cid, provider_id, keep_ratio, instruction,
+          cid: state.current.cid,
+          provider_id,
+          fallback_provider_id,
+          keep_ratio: isNaN(keep_ratio) ? 0.15 : keep_ratio,
+          instruction,
         });
-        toast("压缩任务已启动");
+        toast("压缩任务已在后台启动");
         pollJob();
       } catch (e) { toast(e.message, true); }
     };
   }
+
+  function renderJobBanner(job) {
+    if (!job || job.state === "idle") return;
+    if (job.state === "running") {
+      showBanner(`⏳ ${job.progress || "后台压缩中"}${job.total_chunks ? `（已完成 ${job.done_chunks || 0}/${job.total_chunks} 块）` : ""}`);
+    } else if (job.state === "retry_wait") {
+      showBanner(`⏳ ${job.error || job.progress}`, "取消重试并清除提示", async () => {
+        if (!state.current) return;
+        await apiPost(`/compress/reset/${state.current.cid}`, {});
+        hideBanner();
+      });
+    } else if (job.state === "error") {
+      showBanner(`⚠ ${job.error || "压缩失败（原记录完好无损）"}`, "我知道了", async () => {
+        if (state.current) {
+          try { await apiPost(`/compress/reset/${state.current.cid}`, {}); } catch (e) { /* ignore */ }
+        }
+        hideBanner();
+      });
+    }
+  }
+
+  async function checkCompressJobOnce() {
+    if (!state.current) return;
+    try {
+      const d = await apiGet(`/compress/status/${state.current.cid}`);
+      const job = d.job || {};
+      if (job.state === "running") {
+        renderJobBanner(job);
+        pollJob();
+      } else if (job.state === "retry_wait" || job.state === "error") {
+        renderJobBanner(job);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
   function pollJob() {
     clearInterval(state.jobTimer);
     state.jobTimer = setInterval(async () => {
@@ -639,16 +824,17 @@
         const d = await apiGet(`/compress/status/${state.current.cid}`);
         const job = d.job || {};
         if (job.state === "running") {
-          showBanner(`⏳ ${job.progress || "压缩中"}${job.total_chunks ? `（${job.done_chunks || 0}/${job.total_chunks} 块）` : ""}`);
+          renderJobBanner(job);
         } else {
           clearInterval(state.jobTimer);
           if (job.state === "done") {
             hideBanner();
-            toast(`压缩完成：${job.before.msg_count} → ${job.after.msg_count} 条，est ${job.before.est_tokens} → ${job.after.est_tokens} tok`);
+            const tag = job.mode === "auto" ? "自动压缩完成" : "压缩完成";
+            toast(`${tag}（${job.used_provider || ""}）：${job.before.msg_count} → ${job.after.msg_count} 条，~${job.before.est_tokens} → ~${job.after.est_tokens} tok`);
             reloadConv(true);
             loadList();
-          } else if (job.state === "error") {
-            showBanner(`压缩失败：${job.error || "未知错误"}`, "关闭", hideBanner);
+          } else if (job.state === "retry_wait" || job.state === "error") {
+            renderJobBanner(job);
           }
         }
       } catch (e) { /* ignore */ }
@@ -658,29 +844,91 @@
   // ---------- settings ----------
   async function settingsModal() {
     const s = state.settings;
-    const m = openModal("设置", `
-      <div class="row2">
-        <div class="field"><label>快照保留份数</label><input id="st-snap" type="number" min="1" value="${s.snapshot_keep}" /></div>
-        <div class="field"><label>自动刷新间隔（秒，0=关）</label><input id="st-poll" type="number" min="0" value="${s.poll_interval}" /></div>
+    const primaryOpts = buildProviderOptions(s.auto_compress_provider, "🌟 默认（跟随当前聊天模型）");
+    const fbOpts = buildProviderOptions(s.auto_compress_fallback_provider, "不使用备用模型");
+    const defaultInstr = s.default_compress_instruction || DEFAULT_INSTR_FALLBACK;
+
+    const m = openModal("⚙ 对话管理与自动压缩设置", `
+      <div class="settings-section">
+        <div class="sec-title">🤖 自动压缩上下文（后台无感执行 · 失败绝不删记录）</div>
+        <label class="switch-row">
+          <input id="st-auto-en" type="checkbox" ${s.auto_compress_enabled ? "checked" : ""} />
+          <span><strong>开启自动压缩</strong>（当下方三个限制条件满足任意一个时，在机器人回复后自动后台压缩）</span>
+        </label>
+        <div class="row3" style="margin-top:10px">
+          <div class="field">
+            <label>① 对话轮数限制（轮）</label>
+            <input id="st-rounds" type="number" min="0" value="${s.auto_compress_rounds || 0}" placeholder="例：80（填 0 代表不限制）" />
+            <div class="field-hint">例：填 80 代表满 80 轮触发；填 0 不按轮数限制</div>
+          </div>
+          <div class="field">
+            <label>② 消息总字数限制（字）</label>
+            <input id="st-chars" type="number" min="0" step="1000" value="${s.auto_compress_chars || 0}" placeholder="例：50000（填 0 代表不限制）" />
+            <div class="field-hint">含对话正文与 AI 思考字数；例：填 50000 代表 5 万字触发；填 0 不限制</div>
+          </div>
+          <div class="field">
+            <label>③ Token 数限制 & 预警线</label>
+            <input id="st-th" type="number" min="0" step="1000" value="${s.token_threshold || 0}" placeholder="例：30000（填 0 代表不限制）" />
+            <div class="field-hint">含 AI 思考 Token；达到时右上角变红，开启自动压缩后也会触发压缩（填 0 不限制）</div>
+          </div>
+        </div>
+        <div class="row2">
+          <div class="field">
+            <label>首选压缩模型</label>
+            <select id="st-prov">${primaryOpts}</select>
+            <div class="field-hint">默认跟随该会话当前的聊天模型；也可指定专用/无审核模型</div>
+          </div>
+          <div class="field">
+            <label>备用兜底模型（保命防失败）</label>
+            <select id="st-fb-prov">${fbOpts}</select>
+            <div class="field-hint">首选模型因审核拦截、断网、欠费失败时自动顶上；若都失败则 5 分钟后重试（最多 3 次），绝不一刀切删历史</div>
+          </div>
+        </div>
       </div>
-      <div class="row2">
-        <div class="field"><label>上下文压力阈值（est token）</label><input id="st-th" type="number" min="100" value="${s.token_threshold}" /></div>
-        <div class="field"><label>压缩默认保留比例</label><input id="st-ratio" type="number" step="0.05" min="0" max="0.3" value="${s.compress_keep_ratio}" /></div>
+
+      <div class="settings-section">
+        <div class="sec-title">📝 压缩参数与常规设置</div>
+        <div class="row3">
+          <div class="field">
+            <label>压缩保留最近比例（0~0.5）</label>
+            <input id="st-ratio" type="number" step="0.05" min="0" max="0.5" value="${s.compress_keep_ratio}" placeholder="例：0.15（保留最近 15% 对话）" />
+            <div class="field-hint">例：填 0.15 代表保留最近 15% 的原对话不压缩</div>
+          </div>
+          <div class="field">
+            <label>每会话快照保留份数</label>
+            <input id="st-snap" type="number" min="1" value="${s.snapshot_keep}" placeholder="例：20（超出自动滚动淘汰旧快照）" />
+            <div class="field-hint">每次修改或压缩前自动备份，随时可一键回滚</div>
+          </div>
+          <div class="field">
+            <label>面板自动刷新间隔（秒）</label>
+            <input id="st-poll" type="number" min="0" value="${s.poll_interval}" placeholder="例：5（填 0 关闭自动刷新）" />
+            <div class="field-hint">填 5 代表每 5 秒同步一次最新消息；填 0 关闭</div>
+          </div>
+        </div>
+        <div class="field" style="margin-bottom:4px">
+          <label>压缩摘要提示词（留空则自动使用框内灰字显示的默认提示词）</label>
+          <textarea id="st-instr" placeholder="默认提示词：${esc(defaultInstr)}">${esc(s.compress_instruction || "")}</textarea>
+          <div class="field-hint">无论是手动压缩还是自动压缩，都会按此要求提炼摘要</div>
+        </div>
       </div>
-      <div class="field"><label>压缩摘要指令（留空用内置默认）</label><textarea id="st-instr">${esc(s.compress_instruction || "")}</textarea></div>
-      <div class="muted small">设置保存在 AstrBot 插件配置中，热生效。</div>
-    `, '<button class="btn" data-close>取消</button><button class="btn primary" id="st-ok">保存设置</button>');
+    `, '<button class="btn" data-close>取消</button><button class="btn primary" id="st-ok">保存设置（立即生效）</button>');
+
     m.querySelector("#st-ok").onclick = async () => {
       try {
         const d = await apiPost("/config", {
-          snapshot_keep: parseInt(m.querySelector("#st-snap").value, 10),
-          poll_interval: parseInt(m.querySelector("#st-poll").value, 10),
-          token_threshold: parseInt(m.querySelector("#st-th").value, 10),
-          compress_keep_ratio: parseFloat(m.querySelector("#st-ratio").value),
+          auto_compress_enabled: m.querySelector("#st-auto-en").checked,
+          auto_compress_rounds: parseInt(m.querySelector("#st-rounds").value, 10) || 0,
+          auto_compress_chars: parseInt(m.querySelector("#st-chars").value, 10) || 0,
+          token_threshold: parseInt(m.querySelector("#st-th").value, 10) || 0,
+          auto_compress_provider: m.querySelector("#st-prov").value,
+          auto_compress_fallback_provider: m.querySelector("#st-fb-prov").value,
+          compress_keep_ratio: parseFloat(m.querySelector("#st-ratio").value) || 0.15,
+          snapshot_keep: Math.max(1, parseInt(m.querySelector("#st-snap").value, 10) || 20),
+          poll_interval: Math.max(0, parseInt(m.querySelector("#st-poll").value, 10) || 0),
           compress_instruction: m.querySelector("#st-instr").value,
         });
         Object.assign(state.settings, d.changed || {});
-        toast("设置已保存");
+        toast("设置已保存并立即生效");
         closeModal();
         setupPoll();
         renderGuard();
@@ -696,22 +944,21 @@
     state.pollTimer = setInterval(async () => {
       try {
         const d = await apiGet("/list");
-        const prev = state.convs;
         state.convs = d.conversations || [];
         renderConvList();
         if (state.current) {
+          checkCompressJobOnce();
           const now = state.convs.find((c) => c.cid === state.current.cid);
           if (now && now.updated_at > state.baseUpdatedAt) {
             if (!state.dirty) {
               await reloadConv(true);
               renderGuard();
             } else {
-              showBanner("会话有新消息，而你有未保存的修改——保存会覆盖新消息，建议先保存或重新加载。",
+              showBanner("会话有新消息进入，而你有未保存的本地修改——直接保存会覆盖新消息，建议先重新加载。",
                 "重新加载", () => reloadConv());
             }
           }
         }
-        void prev;
       } catch (e) { /* ignore */ }
     }, sec * 1000);
   }
@@ -753,4 +1000,3 @@
     boot().catch((e) => showBootError(e.message || String(e)));
   }
 })();
-

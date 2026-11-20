@@ -1,29 +1,61 @@
 {
-  "snapshot_keep": {
-    "description": "每对话快照保留份数（超出滚动淘汰）",
-    "type": "int",
-    "default": 20,
-    "hint": "每次保存/导入/压缩前都会自动快照，可在面板里一键回滚"
+  "auto_compress_enabled": {
+    "description": "开启自动压缩上下文",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，当对话达到下方设定的轮数、字数或 Token 任一限制时，会在后台自动快照并压缩（失败绝不删记录）"
   },
-  "poll_interval": {
-    "description": "面板自动刷新间隔（秒，0=关闭）",
+  "auto_compress_rounds": {
+    "description": "自动压缩触发限制 1：对话轮数（0=不按轮数限制）",
     "type": "int",
-    "default": 5
+    "default": 0,
+    "hint": "例如填 80 代表聊满 80 轮（一问一答算 1 轮）后自动触发后台压缩；填 0 表示不限制"
+  },
+  "auto_compress_chars": {
+    "description": "自动压缩触发限制 2：消息总字数，含 AI 思考内容（0=不按字数限制）",
+    "type": "int",
+    "default": 0,
+    "hint": "例如填 50000 代表总字数达 5 万字后自动触发后台压缩；填 0 表示不限制"
   },
   "token_threshold": {
-    "description": "上下文压力估算阈值（est token，达到后面板提示可能触发自动压缩）",
+    "description": "自动压缩触发限制 3 & 面板预警线：上下文 Token 数，含 AI 思考内容（0=不限制）",
     "type": "int",
     "default": 12800,
-    "hint": "与你 AstrBot 生成设置里的上下文上限保持一致即可；仅作面板提示，不影响 bot 行为"
+    "hint": "达到该 Token 数时面板变红预警；若开启了自动压缩，也会以此作为 Token 触发线（填 0 表示不限制）"
+  },
+  "auto_compress_provider": {
+    "description": "自动压缩首选模型 ID（留空=默认跟随当前聊天模型）",
+    "type": "string",
+    "default": "",
+    "hint": "可在「对话管理 → 设置」下拉框中直接选择；留空则自动使用该会话当前的聊天模型"
+  },
+  "auto_compress_fallback_provider": {
+    "description": "压缩备用兜底模型 ID（留空=不启用备用模型）",
+    "type": "string",
+    "default": "",
+    "hint": "当首选模型因内容审核、网络波动或额度不足压缩失败时，自动切换此备用模型继续压缩"
   },
   "compress_keep_ratio": {
-    "description": "手动压缩默认保留最近对话比例（0~0.3）",
+    "description": "压缩时保留最近对话的比例（0~0.5）",
     "type": "float",
-    "default": 0.15
+    "default": 0.15,
+    "hint": "例如 0.15 代表保留最近 15% 的完整对话不压缩，仅把更早的 85% 历史浓缩为摘要"
   },
   "compress_instruction": {
-    "description": "压缩摘要指令（留空使用内置默认；分块与合并阶段都会使用）",
+    "description": "压缩摘要提示词（留空则使用内置默认提示词）",
     "type": "text",
-    "default": ""
+    "default": "",
+    "hint": "告诉模型在压缩历史时重点保留哪些设定、称呼、剧情与说话风格"
+  },
+  "snapshot_keep": {
+    "description": "每个会话自动快照保留份数（超出滚动淘汰）",
+    "type": "int",
+    "default": 20,
+    "hint": "每次保存/导入/手动或自动压缩前都会自动创建快照，可在面板里一键回滚"
+  },
+  "poll_interval": {
+    "description": "管理面板自动刷新间隔（秒，0=关闭）",
+    "type": "int",
+    "default": 5
   }
 }
