@@ -35,7 +35,7 @@ from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_conversation_manager"
 MAX_TEXT_PER_MSG_FOR_SUMMARY = 2400
-SUMMARY_CHUNK_CHARS = 24000
+SUMMARY_CHUNK_CHARS = 16000
 AUTO_RETRY_INTERVAL_SEC = 300  # 自动压缩失败后等待 5 分钟再试
 AUTO_MAX_RETRIES = 3           # 自动压缩最多连续尝试 3 次
 
@@ -135,8 +135,29 @@ def est_tokens(history: list[dict]) -> int:
     return calc_stats(history)["est_tokens"]
 
 
+def _normalize_contexts_for_chat(msgs: list[dict]) -> list[dict]:
+    """将消息规范为严格 user/assistant 交替且以 assistant 结尾的上下文，便于末尾追加 user 总结指令。"""
+    merged: list[dict] = []
+    for m in msgs:
+        role = "assistant" if m.get("role") == "assistant" else "user"
+        text = str(m.get("content") or "").strip()
+        if not text:
+            continue
+        if merged and merged[-1]["role"] == role:
+            merged[-1]["content"] += "\n" + text
+        else:
+            merged.append({"role": role, "content": text})
+    if not merged:
+        return []
+    if merged[0]["role"] != "user":
+        merged.insert(0, {"role": "user", "content": "（以下为历史对话片段）"})
+    if merged[-1]["role"] != "assistant":
+        merged.append({"role": "assistant", "content": "好的，我了解了。"})
+    return merged
+
+
 def sanitize_for_summary(history: list[dict], max_chars: int = MAX_TEXT_PER_MSG_FOR_SUMMARY) -> list[dict]:
-    """抽取纯文本用于摘要请求（跳过图片/工具/think等非对话正文内容）。"""
+    """抽取纯文本用于摘要请求（跳过图片/工具/think等非对话正文内容，移除 system_reminder）。"""
     out: list[dict] = []
     for m in history:
         role = m.get("role")
@@ -150,7 +171,7 @@ def sanitize_for_summary(history: list[dict], max_chars: int = MAX_TEXT_PER_MSG_
                     t = p.get("text") or ""
                     if t:
                         texts.append(t)
-        body = "\n".join(texts).strip()
+        body = re.sub(r"<system_reminder>[\s\S]*?</system_reminder>", "", "\n".join(texts)).strip()
         if not body:
             continue
         if len(body) > max_chars:
@@ -888,17 +909,24 @@ class ConversationManagerPlugin(Star):
         active_id: str,
         fallback_provider: Any,
         fallback_id: str,
+        contexts: list[dict] | None = None,
+        system_prompt: str | None = None,
     ) -> tuple[str, Any, str]:
-        """调用大模型生成摘要：
+        """调用大模型生成摘要（优先采用仿正常聊天的多轮 contexts 结构，降低网关误拦率）：
         1. 首选模型失败时，等待 3 秒当场重试 1 次；
         2. 若仍失败且配置了备用兜底模型，自动切换到备用模型（同样带当场重试）；
         返回 (summary_text, current_active_provider, current_active_id)。
         """
         async def _try_once(prov, pid: str) -> str:
-            resp = await prov.text_chat(
-                prompt=prompt_text,
-                request_max_retries=1,
-            )
+            kwargs: dict[str, Any] = {
+                "prompt": prompt_text,
+                "request_max_retries": 1,
+            }
+            if contexts:
+                kwargs["contexts"] = contexts
+            if system_prompt:
+                kwargs["system_prompt"] = system_prompt
+            resp = await prov.text_chat(**kwargs)
             text = getattr(resp, "completion_text", None) or getattr(resp, "result_chain", None)
             if isinstance(text, str) and text.strip():
                 return text.strip()
@@ -984,33 +1012,36 @@ class ConversationManagerPlugin(Star):
             for i, chunk in enumerate(chunks, 1):
                 job["progress"] = f"{prefix_tag}：分块摘要 {i}/{len(chunks)}（模型: {active_id}）"
                 job["done_chunks"] = i - 1
-                convo_text = "\n\n".join(
-                    f"【{'用户' if m['role'] == 'user' else '助手'}】{m['content']}" for m in chunk
-                )
+                ctx_msgs = _normalize_contexts_for_chat(chunk)
                 text, active_prov, active_id = await self._call_llm_with_retry_and_fallback(
                     job=job,
-                    prompt_text=f"{instruction}\n\n===对话内容===\n{convo_text}",
+                    prompt_text="请按系统要求，将以上历史对话总结为一份客观、连贯的中文摘要，直接输出正文。",
                     stage_label=f"分块 {i}/{len(chunks)}",
                     active_provider=active_prov,
                     active_id=active_id,
                     fallback_provider=fallback_provider,
                     fallback_id=fallback_id,
+                    contexts=ctx_msgs,
+                    system_prompt=instruction,
                 )
                 summaries.append(text)
 
             if len(summaries) > 1:
                 job["progress"] = f"{prefix_tag}：合并 {len(summaries)} 份分块摘要（模型: {active_id}）"
-                merge_prompt = f"{MERGE_INSTRUCTION}\n\n" + "\n\n".join(
-                    f"===摘要 {i + 1}===\n{s}" for i, s in enumerate(summaries)
-                )
+                merge_ctx: list[dict] = []
+                for idx_s, s in enumerate(summaries, 1):
+                    merge_ctx.append({"role": "user", "content": f"第 {idx_s} 阶段对话摘要：\n{s}"})
+                    merge_ctx.append({"role": "assistant", "content": f"已收到第 {idx_s} 阶段摘要。"})
                 summary, active_prov, active_id = await self._call_llm_with_retry_and_fallback(
                     job=job,
-                    prompt_text=merge_prompt,
+                    prompt_text="请将以上各阶段摘要按时间顺序合并为一份连贯的中文摘要，去除重复并保留所有关键信息，直接输出正文。",
                     stage_label="合并分块摘要",
                     active_provider=active_prov,
                     active_id=active_id,
                     fallback_provider=fallback_provider,
                     fallback_id=fallback_id,
+                    contexts=merge_ctx,
+                    system_prompt=MERGE_INSTRUCTION,
                 )
             else:
                 summary = summaries[0]
